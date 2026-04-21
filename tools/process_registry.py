@@ -335,12 +335,11 @@ class ProcessRegistry:
         )
 
         if use_pty:
-            # Try PTY mode for interactive CLI tools
+            if _IS_WINDOWS:
+                from winpty import PtyProcess as _PtyProcessCls
+            else:
+                from ptyprocess import PtyProcess as _PtyProcessCls
             try:
-                if _IS_WINDOWS:
-                    from winpty import PtyProcess as _PtyProcessCls
-                else:
-                    from ptyprocess import PtyProcess as _PtyProcessCls
                 user_shell = _find_shell()
                 pty_env = _sanitize_subprocess_env(os.environ, env_vars)
                 pty_env["PYTHONUNBUFFERED"] = "1"
@@ -371,8 +370,6 @@ class ProcessRegistry:
                 self._write_checkpoint()
                 return session
 
-            except ImportError:
-                logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
 

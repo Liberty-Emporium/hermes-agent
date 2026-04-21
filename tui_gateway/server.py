@@ -237,10 +237,10 @@ def _estimate_image_tokens(width: int, height: int) -> int:
 
 
 def _image_meta(path: Path) -> dict:
+    from PIL import Image
+
     meta = {"name": path.name}
     try:
-        from PIL import Image
-
         with Image.open(path) as img:
             width, height = img.size
         meta["width"] = int(width)

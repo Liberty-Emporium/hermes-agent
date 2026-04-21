@@ -185,18 +185,10 @@ def proxy_kwargs_for_bot(proxy_url: str | None) -> dict:
     if not proxy_url:
         return {}
     if proxy_url.lower().startswith("socks"):
-        try:
-            from aiohttp_socks import ProxyConnector
+        from aiohttp_socks import ProxyConnector
 
-            connector = ProxyConnector.from_url(proxy_url, rdns=True)
-            return {"connector": connector}
-        except ImportError:
-            logger.warning(
-                "aiohttp_socks not installed — SOCKS proxy %s ignored. "
-                "Run: pip install aiohttp-socks",
-                proxy_url,
-            )
-            return {}
+        connector = ProxyConnector.from_url(proxy_url, rdns=True)
+        return {"connector": connector}
     return {"proxy": proxy_url}
 
 
@@ -218,18 +210,10 @@ def proxy_kwargs_for_aiohttp(proxy_url: str | None) -> tuple[dict, dict]:
     if not proxy_url:
         return {}, {}
     if proxy_url.lower().startswith("socks"):
-        try:
-            from aiohttp_socks import ProxyConnector
+        from aiohttp_socks import ProxyConnector
 
-            connector = ProxyConnector.from_url(proxy_url, rdns=True)
-            return {"connector": connector}, {}
-        except ImportError:
-            logger.warning(
-                "aiohttp_socks not installed — SOCKS proxy %s ignored. "
-                "Run: pip install aiohttp-socks",
-                proxy_url,
-            )
-            return {}, {}
+        connector = ProxyConnector.from_url(proxy_url, rdns=True)
+        return {"connector": connector}, {}
     return {}, {"proxy": proxy_url}
 
 

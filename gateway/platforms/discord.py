@@ -1196,9 +1196,10 @@ class DiscordAdapter(BasePlatformAdapter):
             try:
                 import base64
 
+                from mutagen.oggopus import OggOpus
+
                 duration_secs = 5.0
                 try:
-                    from mutagen.oggopus import OggOpus
                     info = OggOpus(audio_path)
                     duration_secs = info.info.length
                 except Exception:

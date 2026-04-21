@@ -1504,13 +1504,11 @@ def _snapshot_child_pids() -> set:
         pass
 
     # Fallback: psutil
+    import psutil
     try:
-        import psutil
         return {c.pid for c in psutil.Process(my_pid).children()}
-    except Exception:
-        pass
-
-    return set()
+    except psutil.Error:
+        return set()
 
 
 def _mcp_loop_exception_handler(loop, context):

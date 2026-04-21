@@ -71,12 +71,7 @@ def main():
 
     ref_text = ref_text_path.read_text(encoding="utf-8").strip()
 
-    # Import and run NeuTTS
-    try:
-        from neutts import NeuTTS
-    except ImportError:
-        print("Error: neutts not installed. Run: python -m pip install -U neutts[all]", file=sys.stderr)
-        sys.exit(1)
+    from neutts import NeuTTS
 
     tts = NeuTTS(
         backbone_repo=args.model,
@@ -91,11 +86,8 @@ def main():
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    try:
-        import soundfile as sf
-        sf.write(str(out_path), wav, 24000)
-    except ImportError:
-        _write_wav(str(out_path), wav, 24000)
+    import soundfile as sf
+    sf.write(str(out_path), wav, 24000)
 
     print(f"OK: {out_path}", file=sys.stderr)
 

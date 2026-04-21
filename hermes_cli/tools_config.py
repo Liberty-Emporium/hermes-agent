@@ -748,19 +748,14 @@ def _estimate_tool_tokens() -> Dict[str, int]:
     OpenAI-format tool schema.  Triggers tool discovery on first call,
     then caches the result for the rest of the process.
 
-    Returns an empty dict when tiktoken or the registry is unavailable.
+    Returns an empty dict when the registry is unavailable.
     """
     global _tool_token_cache
     if _tool_token_cache is not None:
         return _tool_token_cache
 
-    try:
-        import tiktoken
-        enc = tiktoken.get_encoding("cl100k_base")
-    except Exception:
-        logger.debug("tiktoken unavailable; skipping tool token estimation")
-        _tool_token_cache = {}
-        return _tool_token_cache
+    import tiktoken
+    enc = tiktoken.get_encoding("cl100k_base")
 
     try:
         # Trigger full tool discovery (imports all tool modules).

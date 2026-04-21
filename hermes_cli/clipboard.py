@@ -395,14 +395,11 @@ def _wayland_save(dest: Path) -> bool:
 
 def _convert_to_png(path: Path) -> bool:
     """Convert an image file to PNG in-place (requires Pillow or ImageMagick)."""
-    # Try Pillow first (likely installed in the venv)
+    from PIL import Image
     try:
-        from PIL import Image
         img = Image.open(path)
         img.save(path, "PNG")
         return True
-    except ImportError:
-        pass
     except Exception as e:
         logger.debug("Pillow BMP→PNG conversion failed: %s", e)
 
