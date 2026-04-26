@@ -8,6 +8,7 @@ REST surface without spinning up the whole dashboard.
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import time
 from pathlib import Path
@@ -503,3 +504,126 @@ def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
         "/api/plugins/kanban/events?token=secret-xyz"
     ) as ws:
         assert ws is not None  # handshake succeeded
+
+
+# ---------------------------------------------------------------------------
+# Bulk actions
+# ---------------------------------------------------------------------------
+
+
+def test_bulk_status_ready(client):
+    a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
+    b = client.post("/api/plugins/kanban/tasks", json={"title": "b"}).json()["task"]
+    c2 = client.post("/api/plugins/kanban/tasks", json={"title": "c"}).json()["task"]
+    # Parent-less tasks land in "ready" already; push them to blocked first.
+    for tid in (a["id"], b["id"], c2["id"]):
+        client.patch(f"/api/plugins/kanban/tasks/{tid}",
+                     json={"status": "blocked", "block_reason": "wait"})
+
+    r = client.post("/api/plugins/kanban/tasks/bulk",
+                    json={"ids": [a["id"], b["id"], c2["id"]], "status": "ready"})
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert all(r["ok"] for r in results)
+    # All three are now ready.
+    board = client.get("/api/plugins/kanban/board").json()
+    ready = next(col for col in board["columns"] if col["name"] == "ready")
+    ids = {t["id"] for t in ready["tasks"]}
+    assert {a["id"], b["id"], c2["id"]}.issubset(ids)
+
+
+def test_bulk_archive(client):
+    a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
+    b = client.post("/api/plugins/kanban/tasks", json={"title": "b"}).json()["task"]
+    r = client.post("/api/plugins/kanban/tasks/bulk",
+                    json={"ids": [a["id"], b["id"]], "archive": True})
+    assert r.status_code == 200
+    assert all(r["ok"] for r in r.json()["results"])
+    # Default board (archived hidden) — both gone.
+    board = client.get("/api/plugins/kanban/board").json()
+    ids = {t["id"] for col in board["columns"] for t in col["tasks"]}
+    assert a["id"] not in ids
+    assert b["id"] not in ids
+
+
+def test_bulk_reassign(client):
+    a = client.post("/api/plugins/kanban/tasks",
+                    json={"title": "a", "assignee": "old"}).json()["task"]
+    b = client.post("/api/plugins/kanban/tasks",
+                    json={"title": "b", "assignee": "old"}).json()["task"]
+    r = client.post("/api/plugins/kanban/tasks/bulk",
+                    json={"ids": [a["id"], b["id"]], "assignee": "new"})
+    assert r.status_code == 200
+    for tid in (a["id"], b["id"]):
+        t = client.get(f"/api/plugins/kanban/tasks/{tid}").json()["task"]
+        assert t["assignee"] == "new"
+
+
+def test_bulk_unassign_via_empty_string(client):
+    a = client.post("/api/plugins/kanban/tasks",
+                    json={"title": "a", "assignee": "x"}).json()["task"]
+    r = client.post("/api/plugins/kanban/tasks/bulk",
+                    json={"ids": [a["id"]], "assignee": ""})
+    assert r.status_code == 200
+    t = client.get(f"/api/plugins/kanban/tasks/{a['id']}").json()["task"]
+    assert t["assignee"] is None
+
+
+def test_bulk_partial_failure_doesnt_abort_siblings(client):
+    """One bad id in the middle of a batch must not prevent others from
+    applying."""
+    a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
+    c2 = client.post("/api/plugins/kanban/tasks", json={"title": "c"}).json()["task"]
+    r = client.post("/api/plugins/kanban/tasks/bulk",
+                    json={"ids": [a["id"], "bogus-id", c2["id"]], "priority": 7})
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert len(results) == 3
+    ok_ids = {r["id"] for r in results if r["ok"]}
+    assert a["id"] in ok_ids
+    assert c2["id"] in ok_ids
+    assert any(not r["ok"] and r["id"] == "bogus-id" for r in results)
+    # Good siblings actually got the priority bump.
+    for tid in (a["id"], c2["id"]):
+        t = client.get(f"/api/plugins/kanban/tasks/{tid}").json()["task"]
+        assert t["priority"] == 7
+
+
+def test_bulk_empty_ids_400(client):
+    r = client.post("/api/plugins/kanban/tasks/bulk", json={"ids": []})
+    assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# /config endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_config_returns_defaults_when_section_missing(client):
+    r = client.get("/api/plugins/kanban/config")
+    assert r.status_code == 200
+    data = r.json()
+    # Defaults when dashboard.kanban is missing.
+    assert data["default_tenant"] == ""
+    assert data["lane_by_profile"] is True
+    assert data["include_archived_by_default"] is False
+    assert data["render_markdown"] is True
+
+
+def test_config_reads_dashboard_kanban_section(tmp_path, monkeypatch, client):
+    home = Path(os.environ["HERMES_HOME"])
+    (home / "config.yaml").write_text(
+        "dashboard:\n"
+        "  kanban:\n"
+        "    default_tenant: acme\n"
+        "    lane_by_profile: false\n"
+        "    include_archived_by_default: true\n"
+        "    render_markdown: false\n"
+    )
+    r = client.get("/api/plugins/kanban/config")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["default_tenant"] == "acme"
+    assert data["lane_by_profile"] is False
+    assert data["include_archived_by_default"] is True
+    assert data["render_markdown"] is False

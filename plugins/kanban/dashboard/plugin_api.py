@@ -72,6 +72,21 @@ def _check_ws_token(provided: Optional[str]) -> bool:
     return hmac.compare_digest(str(provided), str(expected))
 
 
+def _conn():
+    """Open a kanban_db connection, creating the schema on first use.
+
+    Every handler that mutates the DB goes through this so the plugin
+    self-heals on a fresh install (no user-visible "no such table"
+    error if somebody hits POST /tasks before GET /board).
+    ``init_db`` is idempotent.
+    """
+    try:
+        kanban_db.init_db()
+    except Exception as exc:
+        log.warning("kanban init_db failed: %s", exc)
+    return kanban_db.connect()
+
+
 # ---------------------------------------------------------------------------
 # Serialization helpers
 # ---------------------------------------------------------------------------
@@ -139,17 +154,10 @@ def get_board(
 ):
     """Return the full board grouped by status column.
 
-    Auto-initializes ``kanban.db`` on first call so a fresh install
-    doesn't surface a "failed to load" error on the plugin tab.
+    ``_conn()`` auto-initializes ``kanban.db`` on first call so a fresh
+    install doesn't surface a "failed to load" error on the plugin tab.
     """
-    # Idempotent; handles the "user opened the tab before running
-    # `hermes kanban init`" case. No-op on established DBs.
-    try:
-        kanban_db.init_db()
-    except Exception as exc:
-        log.warning("kanban init_db failed: %s", exc)
-
-    conn = kanban_db.connect()
+    conn = _conn()
     try:
         tasks = kanban_db.list_tasks(
             conn, tenant=tenant, include_archived=include_archived
@@ -241,7 +249,7 @@ def get_board(
 
 @router.get("/tasks/{task_id}")
 def get_task(task_id: str):
-    conn = kanban_db.connect()
+    conn = _conn()
     try:
         task = kanban_db.get_task(conn, task_id)
         if task is None:
@@ -274,7 +282,7 @@ class CreateTaskBody(BaseModel):
 
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody):
-    conn = kanban_db.connect()
+    conn = _conn()
     try:
         task_id = kanban_db.create_task(
             conn,
@@ -313,7 +321,7 @@ class UpdateTaskBody(BaseModel):
 
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody):
-    conn = kanban_db.connect()
+    conn = _conn()
     try:
         task = kanban_db.get_task(conn, task_id)
         if task is None:
@@ -440,7 +448,7 @@ class CommentBody(BaseModel):
 def add_comment(task_id: str, payload: CommentBody):
     if not payload.body.strip():
         raise HTTPException(status_code=400, detail="body is required")
-    conn = kanban_db.connect()
+    conn = _conn()
     try:
         if kanban_db.get_task(conn, task_id) is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
@@ -463,7 +471,7 @@ class LinkBody(BaseModel):
 
 @router.post("/links")
 def add_link(payload: LinkBody):
-    conn = kanban_db.connect()
+    conn = _conn()
     try:
         kanban_db.link_tasks(conn, payload.parent_id, payload.child_id)
         return {"ok": True}
@@ -475,7 +483,7 @@ def add_link(payload: LinkBody):
 
 @router.delete("/links")
 def delete_link(parent_id: str = Query(...), child_id: str = Query(...)):
-    conn = kanban_db.connect()
+    conn = _conn()
     try:
         ok = kanban_db.unlink_tasks(conn, parent_id, child_id)
         return {"ok": bool(ok)}
@@ -484,12 +492,124 @@ def delete_link(parent_id: str = Query(...), child_id: str = Query(...)):
 
 
 # ---------------------------------------------------------------------------
+# Bulk actions (multi-select on the board)
+# ---------------------------------------------------------------------------
+
+class BulkTaskBody(BaseModel):
+    ids: list[str]
+    status: Optional[str] = None
+    assignee: Optional[str] = None  # "" or None = unassign
+    priority: Optional[int] = None
+    archive: bool = False
+
+
+@router.post("/tasks/bulk")
+def bulk_update(payload: BulkTaskBody):
+    """Apply the same patch to every id in ``payload.ids``.
+
+    This is an *independent* iteration — per-task failures don't abort
+    siblings. Returns per-id outcome so the UI can surface partials.
+    """
+    ids = [i for i in (payload.ids or []) if i]
+    if not ids:
+        raise HTTPException(status_code=400, detail="ids is required")
+    results: list[dict] = []
+    conn = _conn()
+    try:
+        for tid in ids:
+            entry: dict[str, Any] = {"id": tid, "ok": True}
+            try:
+                task = kanban_db.get_task(conn, tid)
+                if task is None:
+                    entry.update(ok=False, error="not found")
+                    results.append(entry)
+                    continue
+                if payload.archive:
+                    if not kanban_db.archive_task(conn, tid):
+                        entry.update(ok=False, error="archive refused")
+                if payload.status is not None and not payload.archive:
+                    s = payload.status
+                    if s == "done":
+                        ok = kanban_db.complete_task(conn, tid)
+                    elif s == "blocked":
+                        ok = kanban_db.block_task(conn, tid)
+                    elif s == "ready":
+                        cur = kanban_db.get_task(conn, tid)
+                        if cur and cur.status == "blocked":
+                            ok = kanban_db.unblock_task(conn, tid)
+                        else:
+                            ok = _set_status_direct(conn, tid, "ready")
+                    elif s in ("todo", "running", "triage"):
+                        ok = _set_status_direct(conn, tid, s)
+                    else:
+                        entry.update(ok=False, error=f"unknown status {s!r}")
+                        results.append(entry)
+                        continue
+                    if not ok:
+                        entry.update(ok=False, error=f"transition to {s!r} refused")
+                if payload.assignee is not None:
+                    try:
+                        if not kanban_db.assign_task(
+                            conn, tid, payload.assignee or None,
+                        ):
+                            entry.update(ok=False, error="assign refused")
+                    except RuntimeError as e:
+                        entry.update(ok=False, error=str(e))
+                if payload.priority is not None:
+                    with kanban_db.write_txn(conn):
+                        conn.execute(
+                            "UPDATE tasks SET priority = ? WHERE id = ?",
+                            (int(payload.priority), tid),
+                        )
+                        conn.execute(
+                            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                            "VALUES (?, 'priority', ?, ?)",
+                            (tid, json.dumps({"priority": int(payload.priority)}),
+                             int(time.time())),
+                        )
+            except Exception as e:  # defensive — one bad id shouldn't kill the batch
+                entry.update(ok=False, error=str(e))
+            results.append(entry)
+        return {"results": results}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Plugin config (read dashboard.kanban.* defaults from config.yaml)
+# ---------------------------------------------------------------------------
+
+@router.get("/config")
+def get_config():
+    """Return kanban dashboard preferences from ~/.hermes/config.yaml.
+
+    Reads the ``dashboard.kanban`` section if present; defaults otherwise.
+    Used by the UI to pre-select tenant filters, toggle markdown rendering,
+    or set column-width preferences without a round-trip per page load.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+    except Exception:
+        cfg = {}
+    dash_cfg = (cfg.get("dashboard") or {})
+    # dashboard.kanban may itself be a dict; fall back to {}.
+    k_cfg = dash_cfg.get("kanban") or {}
+    return {
+        "default_tenant": k_cfg.get("default_tenant") or "",
+        "lane_by_profile": bool(k_cfg.get("lane_by_profile", True)),
+        "include_archived_by_default": bool(k_cfg.get("include_archived_by_default", False)),
+        "render_markdown": bool(k_cfg.get("render_markdown", True)),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Dispatch nudge (optional quick-path so the UI doesn't wait 60 s)
 # ---------------------------------------------------------------------------
 
 @router.post("/dispatch")
 def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max")):
-    conn = kanban_db.connect()
+    conn = _conn()
     try:
         result = kanban_db.dispatch_once(
             conn, dry_run=dry_run, max_spawn=max_n,

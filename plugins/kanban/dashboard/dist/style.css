@@ -426,3 +426,231 @@
   gap: 0.2rem;
   align-items: center;
 }
+
+/* ---- Selection chrome ----------------------------------------------- */
+
+.hermes-kanban-card--selected :where(.hermes-kanban-card-content) {
+  box-shadow: 0 0 0 2px var(--color-ring) inset,
+              0 0 0 1px var(--color-ring) inset;
+  background: color-mix(in srgb, var(--color-ring) 6%, var(--color-card));
+}
+
+.hermes-kanban-card-check {
+  width: 0.85rem;
+  height: 0.85rem;
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--color-ring);
+}
+
+/* ---- Bulk action bar ------------------------------------------------ */
+
+.hermes-kanban-bulk {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.75rem;
+  background: color-mix(in srgb, var(--color-ring) 10%, var(--color-card));
+  border: 1px solid color-mix(in srgb, var(--color-ring) 40%, var(--color-border));
+  border-radius: var(--radius-sm, 0.25rem);
+  flex-wrap: wrap;
+}
+.hermes-kanban-bulk-count {
+  font-weight: 600;
+  font-size: 0.75rem;
+  padding-right: 0.25rem;
+}
+.hermes-kanban-bulk-btn {
+  height: 1.7rem !important;
+  padding: 0 0.5rem !important;
+  font-size: 0.7rem !important;
+  border: 1px solid var(--color-border);
+  cursor: pointer;
+}
+.hermes-kanban-bulk-btn:hover {
+  background: color-mix(in srgb, var(--color-foreground) 8%, transparent);
+}
+.hermes-kanban-bulk-reassign {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding-left: 0.5rem;
+  border-left: 1px solid color-mix(in srgb, var(--color-border) 70%, transparent);
+}
+
+/* ---- Dependency editor chips --------------------------------------- */
+
+.hermes-kanban-deps-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.4rem;
+}
+.hermes-kanban-deps-label {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--color-muted-foreground);
+  min-width: 4rem;
+}
+.hermes-kanban-deps-chips {
+  display: flex;
+  gap: 0.3rem;
+  flex-wrap: wrap;
+  flex: 1;
+}
+.hermes-kanban-deps-empty {
+  font-size: 0.7rem;
+  color: var(--color-muted-foreground);
+  font-style: italic;
+}
+.hermes-kanban-dep-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.15rem;
+  padding: 0.1rem 0.35rem;
+  background: color-mix(in srgb, var(--color-foreground) 6%, transparent);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 0.25rem);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.68rem;
+  color: var(--color-foreground);
+}
+.hermes-kanban-dep-chip-x {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  color: var(--color-muted-foreground);
+  cursor: pointer;
+  font-size: 0.85rem;
+  line-height: 1;
+  padding: 0 0.15rem;
+}
+.hermes-kanban-dep-chip-x:hover { color: var(--color-destructive, #d14a4a); }
+
+/* ---- Inline edit affordances --------------------------------------- */
+
+.hermes-kanban-editable {
+  cursor: pointer;
+  border-bottom: 1px dotted color-mix(in srgb, var(--color-border) 80%, transparent);
+}
+.hermes-kanban-editable:hover {
+  color: var(--color-foreground);
+  border-bottom-color: var(--color-ring);
+}
+
+.hermes-kanban-drawer-title-text {
+  cursor: pointer;
+}
+.hermes-kanban-drawer-title-text:hover {
+  text-decoration: underline;
+  text-decoration-color: var(--color-ring);
+  text-decoration-style: dotted;
+  text-underline-offset: 3px;
+}
+
+.hermes-kanban-edit-row {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  width: 100%;
+}
+
+.hermes-kanban-section-head-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.hermes-kanban-edit-link {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  color: var(--color-muted-foreground);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  cursor: pointer;
+  padding: 0;
+}
+.hermes-kanban-edit-link:hover { color: var(--color-ring); }
+
+.hermes-kanban-textarea {
+  width: 100%;
+  min-height: 8rem;
+  background: var(--color-card);
+  color: var(--color-foreground);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 0.25rem);
+  padding: 0.5rem 0.6rem;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.8rem;
+  line-height: 1.5;
+  resize: vertical;
+}
+.hermes-kanban-textarea:focus {
+  outline: none;
+  border-color: var(--color-ring);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-ring) 30%, transparent);
+}
+
+/* ---- Markdown rendering -------------------------------------------- */
+
+.hermes-kanban-md {
+  font-size: 0.8rem;
+  line-height: 1.55;
+  color: var(--color-foreground);
+}
+.hermes-kanban-md p  { margin: 0.25rem 0; }
+.hermes-kanban-md h1,
+.hermes-kanban-md h2,
+.hermes-kanban-md h3,
+.hermes-kanban-md h4 {
+  margin: 0.6rem 0 0.2rem;
+  line-height: 1.25;
+}
+.hermes-kanban-md h1 { font-size: 1.05rem; }
+.hermes-kanban-md h2 { font-size: 0.95rem; }
+.hermes-kanban-md h3 { font-size: 0.88rem; }
+.hermes-kanban-md h4 { font-size: 0.82rem; }
+.hermes-kanban-md ul {
+  margin: 0.25rem 0 0.25rem 1.1rem;
+  padding: 0;
+}
+.hermes-kanban-md li { margin: 0.1rem 0; }
+.hermes-kanban-md a {
+  color: var(--color-ring);
+  text-decoration: underline;
+}
+.hermes-kanban-md code {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.75rem;
+  padding: 0.05rem 0.3rem;
+  background: color-mix(in srgb, var(--color-foreground) 8%, transparent);
+  border-radius: 3px;
+}
+.hermes-kanban-md-code {
+  margin: 0.35rem 0;
+  padding: 0.5rem 0.6rem;
+  background: color-mix(in srgb, var(--color-foreground) 5%, transparent);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 0.25rem);
+  overflow-x: auto;
+}
+.hermes-kanban-md-code code {
+  background: transparent;
+  padding: 0;
+  font-size: 0.75rem;
+  white-space: pre;
+}
+.hermes-kanban-md strong { font-weight: 600; }
+
+/* ---- Touch-drag proxy ---------------------------------------------- */
+
+.hermes-kanban-touch-proxy {
+  pointer-events: none;
+  opacity: 0.85;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.35);
+  transform: scale(1.02);
+  transition: none;
+}

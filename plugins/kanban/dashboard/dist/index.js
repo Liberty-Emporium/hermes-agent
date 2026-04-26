@@ -6,33 +6,25 @@
  * and tails task_events over a WebSocket for live updates.
  *
  * Plain IIFE, no build step. Uses window.__HERMES_PLUGIN_SDK__ for React +
- * shadcn primitives; HTML5 drag-and-drop for card movement.
+ * shadcn primitives; HTML5 drag-and-drop for card movement on desktop and
+ * a pointer-based fallback for touch.
  */
 (function () {
   "use strict";
 
   const SDK = window.__HERMES_PLUGIN_SDK__;
-  if (!SDK) {
-    // Dashboard host didn't expose the SDK — nothing we can do.
-    return;
-  }
+  if (!SDK) return;
 
   const { React } = SDK;
   const h = React.createElement;
   const {
-    Card,
-    CardContent,
-    Badge,
-    Button,
-    Input,
-    Label,
-    Select,
-    SelectOption,
+    Card, CardContent,
+    Badge, Button, Input, Label, Select, SelectOption,
   } = SDK.components;
   const { useState, useEffect, useCallback, useMemo, useRef } = SDK.hooks;
   const { cn, timeAgo } = SDK.utils;
 
-  // Order matters — matches BOARD_COLUMNS in plugin_api.py.
+  // Order matches BOARD_COLUMNS in plugin_api.py.
   const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "done"];
   const COLUMN_LABEL = {
     triage: "Triage",
@@ -62,8 +54,6 @@
     archived: "hermes-kanban-dot-archived",
   };
 
-  // Confirmations required for any irreversible-looking status transition
-  // (the CLI can still do any of these without a prompt).
   const DESTRUCTIVE_TRANSITIONS = {
     done: "Mark this task as done? The worker's claim is released and dependent children become ready.",
     archived: "Archive this task? It disappears from the default board view.",
@@ -71,17 +61,162 @@
   };
 
   const API = "/api/plugins/kanban";
+  const MIME_TASK = "text/x-hermes-task";
 
   // -------------------------------------------------------------------------
-  // Error boundary — a bad card render shouldn't crash the whole tab.
+  // Minimal safe markdown renderer.
+  //
+  // Recognises a small subset (headings, bold, italic, inline code, fenced
+  // code, links, bullet lists, paragraphs). HTML escaping first, then
+  // inline replacements against the escaped string — no raw HTML from the
+  // user is ever executed.
+  // -------------------------------------------------------------------------
+
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+  function renderInline(esc) {
+    // Fenced code has already been extracted before this runs; process
+    // inline replacements on the escaped string.
+    return esc
+      // inline code
+      .replace(/`([^`\n]+)`/g, (_m, c) => `<code>${c}</code>`)
+      // bold
+      .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+      // italic
+      .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+      // safe links — only http(s) and mailto
+      .replace(
+        /\[([^\]\n]+)\]\((https?:\/\/[^\s)]+|mailto:[^\s)]+)\)/g,
+        (_m, text, href) =>
+          `<a href="${href}" target="_blank" rel="noopener noreferrer">${text}</a>`,
+      );
+  }
+  function renderMarkdown(src) {
+    if (!src) return "";
+    // Split out fenced code blocks first so their contents aren't mangled.
+    const blocks = [];
+    let working = String(src).replace(/```([\s\S]*?)```/g, (_m, code) => {
+      blocks.push(code);
+      return `\u0000CODE${blocks.length - 1}\u0000`;
+    });
+    const escaped = escapeHtml(working);
+    const lines = escaped.split(/\r?\n/);
+    const out = [];
+    let inList = false;
+    for (const raw of lines) {
+      const line = raw;
+      const bullet = /^\s*[-*]\s+(.*)$/.exec(line);
+      const heading = /^(#{1,4})\s+(.*)$/.exec(line);
+      if (bullet) {
+        if (!inList) { out.push("<ul>"); inList = true; }
+        out.push(`<li>${renderInline(bullet[1])}</li>`);
+        continue;
+      }
+      if (inList) { out.push("</ul>"); inList = false; }
+      if (heading) {
+        const level = heading[1].length;
+        out.push(`<h${level}>${renderInline(heading[2])}</h${level}>`);
+      } else if (line.trim() === "") {
+        out.push("");
+      } else {
+        out.push(`<p>${renderInline(line)}</p>`);
+      }
+    }
+    if (inList) out.push("</ul>");
+    let html = out.join("\n");
+    // Re-insert fenced code blocks.
+    html = html.replace(/\u0000CODE(\d+)\u0000/g, (_m, i) =>
+      `<pre class="hermes-kanban-md-code"><code>${escapeHtml(blocks[Number(i)])}</code></pre>`,
+    );
+    return html;
+  }
+
+  function MarkdownBlock(props) {
+    const enabled = props.enabled !== false;
+    if (!enabled) {
+      return h("pre", { className: "hermes-kanban-pre" }, props.source || "");
+    }
+    return h("div", {
+      className: "hermes-kanban-md",
+      dangerouslySetInnerHTML: { __html: renderMarkdown(props.source || "") },
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Touch drag-drop helper.
+  //
+  // HTML5 DnD is desktop-only. On touch devices we attach a pointerdown
+  // handler that simulates a drag proxy and fires a custom event on the
+  // column under the finger when released. Columns listen for both the
+  // standard `drop` event and our `hermes-kanban:drop` event.
+  // -------------------------------------------------------------------------
+
+  function attachTouchDrag(el, taskId) {
+    if (!el) return;
+    function onDown(e) {
+      if (e.pointerType !== "touch") return;
+      e.preventDefault();
+      const proxy = el.cloneNode(true);
+      proxy.classList.add("hermes-kanban-touch-proxy");
+      document.body.appendChild(proxy);
+      let lastTarget = null;
+
+      function move(ev) {
+        proxy.style.left = `${ev.clientX - proxy.offsetWidth / 2}px`;
+        proxy.style.top = `${ev.clientY - 24}px`;
+        proxy.style.display = "none";
+        const under = document.elementFromPoint(ev.clientX, ev.clientY);
+        proxy.style.display = "";
+        const col = under && under.closest && under.closest("[data-kanban-column]");
+        if (col !== lastTarget) {
+          if (lastTarget) lastTarget.classList.remove("hermes-kanban-column--drop");
+          if (col) col.classList.add("hermes-kanban-column--drop");
+          lastTarget = col;
+        }
+      }
+      function up() {
+        document.removeEventListener("pointermove", move);
+        document.removeEventListener("pointerup", up);
+        document.removeEventListener("pointercancel", up);
+        if (lastTarget) {
+          lastTarget.classList.remove("hermes-kanban-column--drop");
+          const status = lastTarget.getAttribute("data-kanban-column");
+          lastTarget.dispatchEvent(new CustomEvent("hermes-kanban:drop", {
+            detail: { taskId, status },
+            bubbles: true,
+          }));
+        }
+        proxy.remove();
+      }
+      // Kick off proxy at the pointer origin.
+      proxy.style.position = "fixed";
+      proxy.style.pointerEvents = "none";
+      proxy.style.opacity = "0.85";
+      proxy.style.zIndex = "9999";
+      proxy.style.width = `${el.offsetWidth}px`;
+      proxy.style.left = `${e.clientX - el.offsetWidth / 2}px`;
+      proxy.style.top = `${e.clientY - 24}px`;
+      document.addEventListener("pointermove", move);
+      document.addEventListener("pointerup", up);
+      document.addEventListener("pointercancel", up);
+    }
+    el.addEventListener("pointerdown", onDown);
+    return function () { el.removeEventListener("pointerdown", onDown); };
+  }
+
+  // -------------------------------------------------------------------------
+  // Error boundary
   // -------------------------------------------------------------------------
 
   class ErrorBoundary extends React.Component {
-    constructor(props) {
-      super(props);
-      this.state = { error: null };
-    }
-    static getDerivedStateFromError(error) { return { error: error }; }
+    constructor(props) { super(props); this.state = { error: null }; }
+    static getDerivedStateFromError(error) { return { error }; }
     componentDidCatch(error, info) {
       // eslint-disable-next-line no-console
       console.error("Kanban plugin crashed:", error, info);
@@ -111,6 +246,7 @@
 
   function KanbanPage() {
     const [board, setBoard] = useState(null);
+    const [config, setConfig] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
 
@@ -119,14 +255,31 @@
     const [includeArchived, setIncludeArchived] = useState(false);
     const [search, setSearch] = useState("");
     const [laneByProfile, setLaneByProfile] = useState(true);
+    const [configApplied, setConfigApplied] = useState(false);
 
     const [selectedTaskId, setSelectedTaskId] = useState(null);
+    const [selectedIds, setSelectedIds] = useState(() => new Set());
 
     const cursorRef = useRef(0);
     const reloadTimerRef = useRef(null);
     const wsRef = useRef(null);
-    const wsBackoffRef = useRef(1000);   // reconnect delay in ms, grows on failure
+    const wsBackoffRef = useRef(1000);
     const wsClosedRef = useRef(false);
+
+    // --- load config once ---------------------------------------------------
+    useEffect(function () {
+      SDK.fetchJSON(`${API}/config`)
+        .then(function (c) {
+          setConfig(c);
+          if (!configApplied) {
+            if (c.default_tenant) setTenantFilter(c.default_tenant);
+            if (typeof c.lane_by_profile === "boolean") setLaneByProfile(c.lane_by_profile);
+            if (typeof c.include_archived_by_default === "boolean") setIncludeArchived(c.include_archived_by_default);
+            setConfigApplied(true);
+          }
+        })
+        .catch(function () { setConfig({ render_markdown: true }); });
+    }, []);  // eslint-disable-line react-hooks/exhaustive-deps
 
     // --- fetch full board ---------------------------------------------------
     const loadBoard = useCallback(() => {
@@ -143,12 +296,9 @@
         .catch(function (err) {
           setError(String(err && err.message ? err.message : err));
         })
-        .finally(function () {
-          setLoading(false);
-        });
+        .finally(function () { setLoading(false); });
     }, [tenantFilter, includeArchived]);
 
-    // Debounced reload — a burst of events shouldn't trigger N refetches.
     const scheduleReload = useCallback(function () {
       if (reloadTimerRef.current) return;
       reloadTimerRef.current = setTimeout(function () {
@@ -167,11 +317,10 @@
       };
     }, [loadBoard]);
 
-    // --- live updates via WebSocket ----------------------------------------
+    // --- WebSocket ---------------------------------------------------------
     useEffect(function () {
       if (!board) return undefined;
       wsClosedRef.current = false;
-
       function openWs() {
         if (wsClosedRef.current) return;
         const token = window.__HERMES_SESSION_TOKEN__ || "";
@@ -182,12 +331,9 @@
         });
         const url = `${proto}//${window.location.host}${API}/events?${qs}`;
         let ws;
-        try { ws = new WebSocket(url); } catch (e) { return; }
+        try { ws = new WebSocket(url); } catch (_e) { return; }
         wsRef.current = ws;
-
-        ws.onopen = function () {
-          wsBackoffRef.current = 1000;  // reset backoff on successful open
-        };
+        ws.onopen = function () { wsBackoffRef.current = 1000; };
         ws.onmessage = function (ev) {
           try {
             const msg = JSON.parse(ev.data);
@@ -195,24 +341,20 @@
               cursorRef.current = msg.cursor || cursorRef.current;
               scheduleReload();
             }
-          } catch (_e) { /* ignore malformed */ }
+          } catch (_e) { /* ignore */ }
         };
         ws.onclose = function (ev) {
           if (wsClosedRef.current) return;
-          // Auth rejection — don't loop forever.
           if (ev && ev.code === 1008) {
             setError("WebSocket auth failed — reload the page to refresh the session token.");
             return;
           }
-          // Exponential backoff, capped at 30s.
           const delay = Math.min(wsBackoffRef.current, 30000);
           wsBackoffRef.current = Math.min(wsBackoffRef.current * 2, 30000);
           setTimeout(openWs, delay);
         };
       }
-
       openWs();
-
       return function () {
         wsClosedRef.current = true;
         try { wsRef.current && wsRef.current.close(); } catch (_e) { /* noop */ }
@@ -233,20 +375,15 @@
       };
       return Object.assign({}, board, {
         columns: board.columns.map(function (col) {
-          return Object.assign({}, col, {
-            tasks: col.tasks.filter(filterTask),
-          });
+          return Object.assign({}, col, { tasks: col.tasks.filter(filterTask) });
         }),
       });
     }, [board, assigneeFilter, search]);
 
     // --- actions ------------------------------------------------------------
     const moveTask = useCallback(function (taskId, newStatus) {
-      // Confirm for destructive-looking moves (drag into Done / Archived / Blocked).
       const confirmMsg = DESTRUCTIVE_TRANSITIONS[newStatus];
       if (confirmMsg && !window.confirm(confirmMsg)) return;
-
-      // Optimistic move: update local board first, reconcile on refresh.
       setBoard(function (b) {
         if (!b) return b;
         let moved = null;
@@ -261,17 +398,16 @@
           const dest = columns.find(function (c) { return c.name === newStatus; });
           if (dest) dest.tasks = [moved].concat(dest.tasks);
         }
-        return Object.assign({}, b, { columns: columns });
+        return Object.assign({}, b, { columns });
       });
       SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(taskId)}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ status: newStatus }),
-      })
-        .catch(function (err) {
-          setError(`Move failed: ${err.message || err}`);
-          loadBoard();
-        });
+      }).catch(function (err) {
+        setError(`Move failed: ${err.message || err}`);
+        loadBoard();
+      });
     }, [loadBoard]);
 
     const createTask = useCallback(function (body) {
@@ -281,6 +417,37 @@
         body: JSON.stringify(body),
       }).then(loadBoard);
     }, [loadBoard]);
+
+    const toggleSelected = useCallback(function (id, additive) {
+      setSelectedIds(function (prev) {
+        const next = new Set(additive ? prev : []);
+        if (prev.has(id)) next.delete(id);
+        else next.add(id);
+        return next;
+      });
+    }, []);
+    const clearSelected = useCallback(function () { setSelectedIds(new Set()); }, []);
+
+    const applyBulk = useCallback(function (patch, confirmMsg) {
+      if (selectedIds.size === 0) return;
+      if (confirmMsg && !window.confirm(confirmMsg)) return;
+      const body = Object.assign({ ids: Array.from(selectedIds) }, patch);
+      SDK.fetchJSON(`${API}/tasks/bulk`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      })
+        .then(function (res) {
+          const failed = (res.results || []).filter(function (r) { return !r.ok; });
+          if (failed.length > 0) {
+            setError(`Bulk: ${failed.length} of ${res.results.length} failed: ` +
+              failed.slice(0, 3).map(function (f) { return `${f.id} (${f.error})`; }).join("; "));
+          }
+          clearSelected();
+          loadBoard();
+        })
+        .catch(function (e) { setError(String(e.message || e)); });
+    }, [selectedIds, loadBoard, clearSelected]);
 
     // --- render -------------------------------------------------------------
     if (loading && !board) {
@@ -299,20 +466,17 @@
     }
     if (!filteredBoard) return null;
 
+    const renderMd = !config || config.render_markdown !== false;
+
     return h(ErrorBoundary, null,
       h("div", { className: "hermes-kanban flex flex-col gap-4" },
         h(BoardToolbar, {
           board: board,
-          tenantFilter: tenantFilter,
-          setTenantFilter: setTenantFilter,
-          assigneeFilter: assigneeFilter,
-          setAssigneeFilter: setAssigneeFilter,
-          includeArchived: includeArchived,
-          setIncludeArchived: setIncludeArchived,
-          laneByProfile: laneByProfile,
-          setLaneByProfile: setLaneByProfile,
-          search: search,
-          setSearch: setSearch,
+          tenantFilter, setTenantFilter,
+          assigneeFilter, setAssigneeFilter,
+          includeArchived, setIncludeArchived,
+          laneByProfile, setLaneByProfile,
+          search, setSearch,
           onNudgeDispatch: function () {
             SDK.fetchJSON(`${API}/dispatch?max=8`, { method: "POST" })
               .then(loadBoard)
@@ -320,31 +484,41 @@
           },
           onRefresh: loadBoard,
         }),
+        selectedIds.size > 0 ? h(BulkActionBar, {
+          count: selectedIds.size,
+          assignees: (board && board.assignees) || [],
+          onApply: applyBulk,
+          onClear: clearSelected,
+        }) : null,
         error ? h("div", { className: "text-xs text-destructive px-2" }, error) : null,
         h(BoardColumns, {
           board: filteredBoard,
-          laneByProfile: laneByProfile,
+          laneByProfile,
+          selectedIds,
+          toggleSelected,
           onMove: moveTask,
           onOpen: setSelectedTaskId,
           onCreate: createTask,
+          allTasks: board.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
         }),
         selectedTaskId ? h(TaskDrawer, {
           taskId: selectedTaskId,
           onClose: function () { setSelectedTaskId(null); },
           onRefresh: loadBoard,
+          renderMarkdown: renderMd,
+          allTasks: board.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
         }) : null,
       ),
     );
   }
 
   // -------------------------------------------------------------------------
-  // Toolbar (filters + global actions)
+  // Toolbar
   // -------------------------------------------------------------------------
 
   function BoardToolbar(props) {
     const tenants = (props.board && props.board.tenants) || [];
     const assignees = (props.board && props.board.assignees) || [];
-
     return h("div", { className: "flex flex-wrap items-end gap-3" },
       h("div", { className: "flex flex-col gap-1" },
         h(Label, { className: "text-xs text-muted-foreground" }, "Search"),
@@ -411,6 +585,64 @@
   }
 
   // -------------------------------------------------------------------------
+  // Bulk action bar (appears when >= 1 card is selected)
+  // -------------------------------------------------------------------------
+
+  function BulkActionBar(props) {
+    const [assignee, setAssignee] = useState("");
+    return h("div", { className: "hermes-kanban-bulk" },
+      h("span", { className: "hermes-kanban-bulk-count" },
+        `${props.count} selected`),
+      h(Button, {
+        onClick: function () { props.onApply({ status: "ready" }); },
+        className: "hermes-kanban-bulk-btn",
+      }, "→ ready"),
+      h(Button, {
+        onClick: function () {
+          props.onApply({ status: "done" },
+            `Mark ${props.count} task(s) as done?`);
+        },
+        className: "hermes-kanban-bulk-btn",
+      }, "Complete"),
+      h(Button, {
+        onClick: function () {
+          props.onApply({ archive: true },
+            `Archive ${props.count} task(s)?`);
+        },
+        className: "hermes-kanban-bulk-btn",
+      }, "Archive"),
+      h("div", { className: "hermes-kanban-bulk-reassign" },
+        h(Select, {
+          value: assignee,
+          onChange: function (e) { setAssignee(e.target.value); },
+          className: "h-7 text-xs",
+        },
+          h(SelectOption, { value: "" }, "— reassign —"),
+          h(SelectOption, { value: "__none__" }, "(unassign)"),
+          props.assignees.map(function (a) {
+            return h(SelectOption, { key: a, value: a }, a);
+          }),
+        ),
+        h(Button, {
+          onClick: function () {
+            if (!assignee) return;
+            props.onApply({ assignee: assignee === "__none__" ? "" : assignee });
+            setAssignee("");
+          },
+          disabled: !assignee,
+          className: cn("hermes-kanban-bulk-btn",
+            !assignee ? "opacity-40 cursor-not-allowed" : ""),
+        }, "Apply"),
+      ),
+      h("div", { className: "flex-1" }),
+      h(Button, {
+        onClick: props.onClear,
+        className: "hermes-kanban-bulk-btn",
+      }, "Clear"),
+    );
+  }
+
+  // -------------------------------------------------------------------------
   // Columns
   // -------------------------------------------------------------------------
 
@@ -421,9 +653,12 @@
           key: col.name,
           column: col,
           laneByProfile: props.laneByProfile,
+          selectedIds: props.selectedIds,
+          toggleSelected: props.toggleSelected,
           onMove: props.onMove,
           onOpen: props.onOpen,
           onCreate: props.onCreate,
+          allTasks: props.allTasks,
         });
       }),
     );
@@ -432,6 +667,20 @@
   function Column(props) {
     const [dragOver, setDragOver] = useState(false);
     const [showCreate, setShowCreate] = useState(false);
+    const colRef = useRef(null);
+
+    // Listen for our synthetic touch-drop events from attachTouchDrag().
+    useEffect(function () {
+      if (!colRef.current) return undefined;
+      const el = colRef.current;
+      function onTouchDrop(e) {
+        if (e.detail && e.detail.status === props.column.name) {
+          props.onMove(e.detail.taskId, props.column.name);
+        }
+      }
+      el.addEventListener("hermes-kanban:drop", onTouchDrop);
+      return function () { el.removeEventListener("hermes-kanban:drop", onTouchDrop); };
+    }, [props.column.name, props.onMove]);
 
     const handleDragOver = function (e) {
       e.preventDefault();
@@ -442,11 +691,10 @@
     const handleDrop = function (e) {
       e.preventDefault();
       setDragOver(false);
-      const taskId = e.dataTransfer.getData("text/x-hermes-task");
+      const taskId = e.dataTransfer.getData(MIME_TASK);
       if (taskId) props.onMove(taskId, props.column.name);
     };
 
-    // Running column gets per-assignee lanes when the toggle is on.
     const lanes = useMemo(function () {
       if (!props.laneByProfile || props.column.name !== "running") return null;
       const byProfile = {};
@@ -460,6 +708,8 @@
     }, [props.column, props.laneByProfile]);
 
     return h("div", {
+      ref: colRef,
+      "data-kanban-column": props.column.name,
       className: cn(
         "hermes-kanban-column",
         dragOver ? "hermes-kanban-column--drop" : "",
@@ -485,6 +735,7 @@
         COLUMN_HELP[props.column.name] || ""),
       showCreate ? h(InlineCreate, {
         columnName: props.column.name,
+        allTasks: props.allTasks,
         onSubmit: function (body) {
           props.onCreate(body).then(function () { setShowCreate(false); });
         },
@@ -501,12 +752,22 @@
                     h("span", { className: "hermes-kanban-lane-count" }, lane.tasks.length),
                   ),
                   lane.tasks.map(function (t) {
-                    return h(TaskCard, { key: t.id, task: t, onOpen: props.onOpen });
+                    return h(TaskCard, {
+                      key: t.id, task: t,
+                      selected: props.selectedIds.has(t.id),
+                      toggleSelected: props.toggleSelected,
+                      onOpen: props.onOpen,
+                    });
                   }),
                 );
               })
             : props.column.tasks.map(function (t) {
-                return h(TaskCard, { key: t.id, task: t, onOpen: props.onOpen });
+                return h(TaskCard, {
+                  key: t.id, task: t,
+                  selected: props.selectedIds.has(t.id),
+                  toggleSelected: props.toggleSelected,
+                  onOpen: props.onOpen,
+                });
               }),
       ),
     );
@@ -518,23 +779,54 @@
 
   function TaskCard(props) {
     const t = props.task;
+    const cardRef = useRef(null);
+
+    useEffect(function () {
+      return attachTouchDrag(cardRef.current, t.id);
+    }, [t.id]);
 
     const handleDragStart = function (e) {
-      e.dataTransfer.setData("text/x-hermes-task", t.id);
+      e.dataTransfer.setData(MIME_TASK, t.id);
       e.dataTransfer.effectAllowed = "move";
+    };
+    const handleClick = function (e) {
+      // Shift-click or ctrl/cmd-click toggles selection instead of opening.
+      if (e.shiftKey || e.ctrlKey || e.metaKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        props.toggleSelected(t.id, e.ctrlKey || e.metaKey);
+        return;
+      }
+      props.onOpen(t.id);
+    };
+    const handleCheckbox = function (e) {
+      e.stopPropagation();
+      props.toggleSelected(t.id, true);
     };
 
     const progress = t.progress;
 
     return h("div", {
-      className: "hermes-kanban-card",
+      ref: cardRef,
+      className: cn(
+        "hermes-kanban-card",
+        props.selected ? "hermes-kanban-card--selected" : "",
+      ),
       draggable: true,
       onDragStart: handleDragStart,
-      onClick: function () { props.onOpen(t.id); },
+      onClick: handleClick,
     },
       h(Card, null,
         h(CardContent, { className: "hermes-kanban-card-content" },
           h("div", { className: "hermes-kanban-card-row" },
+            h("input", {
+              type: "checkbox",
+              className: "hermes-kanban-card-check",
+              checked: props.selected,
+              onChange: handleCheckbox,
+              onClick: function (e) { e.stopPropagation(); },
+              title: "Select for bulk actions",
+            }),
             h("span", { className: "hermes-kanban-card-id" }, t.id),
             t.priority > 0
               ? h(Badge, { className: "hermes-kanban-priority" }, `P${t.priority}`)
@@ -558,8 +850,7 @@
               ? h("span", { className: "hermes-kanban-assignee" }, "@", t.assignee)
               : h("span", { className: "hermes-kanban-unassigned" }, "unassigned"),
             t.comment_count > 0
-              ? h("span", { className: "hermes-kanban-count" },
-                  "💬 ", t.comment_count)
+              ? h("span", { className: "hermes-kanban-count" }, "💬 ", t.comment_count)
               : null,
             t.link_counts && (t.link_counts.parents + t.link_counts.children) > 0
               ? h("span", { className: "hermes-kanban-count" },
@@ -574,27 +865,27 @@
   }
 
   // -------------------------------------------------------------------------
-  // Inline create
+  // Inline create (with parent selector)
   // -------------------------------------------------------------------------
 
   function InlineCreate(props) {
     const [title, setTitle] = useState("");
     const [assignee, setAssignee] = useState("");
     const [priority, setPriority] = useState(0);
+    const [parent, setParent] = useState("");
 
     const submit = function () {
       const trimmed = title.trim();
       if (!trimmed) return;
-      // Creating from the Triage column parks the task in triage.
-      props.onSubmit({
+      const body = {
         title: trimmed,
         assignee: assignee.trim() || null,
         priority: Number(priority) || 0,
         triage: props.columnName === "triage",
-      });
-      setTitle("");
-      setAssignee("");
-      setPriority(0);
+      };
+      if (parent) body.parents = [parent];
+      props.onSubmit(body);
+      setTitle(""); setAssignee(""); setPriority(0); setParent("");
     };
 
     return h("div", { className: "hermes-kanban-inline-create" },
@@ -615,7 +906,7 @@
         h(Input, {
           value: assignee,
           onChange: function (e) { setAssignee(e.target.value); },
-          placeholder: props.columnName === "triage" ? "specifier (optional)" : "assignee (optional)",
+          placeholder: props.columnName === "triage" ? "specifier" : "assignee",
           className: "h-7 text-xs flex-1",
         }),
         h(Input, {
@@ -624,6 +915,17 @@
           onChange: function (e) { setPriority(e.target.value); },
           placeholder: "pri",
           className: "h-7 text-xs w-16",
+        }),
+      ),
+      h(Select, {
+        value: parent,
+        onChange: function (e) { setParent(e.target.value); },
+        className: "h-7 text-xs",
+      },
+        h(SelectOption, { value: "" }, "— no parent —"),
+        (props.allTasks || []).map(function (t) {
+          return h(SelectOption, { key: t.id, value: t.id },
+            `${t.id} — ${(t.title || "").slice(0, 50)}`);
         }),
       ),
       h("div", { className: "flex gap-2" },
@@ -640,7 +942,7 @@
   }
 
   // -------------------------------------------------------------------------
-  // Task drawer (side panel)
+  // Task drawer
   // -------------------------------------------------------------------------
 
   function TaskDrawer(props) {
@@ -648,6 +950,7 @@
     const [loading, setLoading] = useState(true);
     const [err, setErr] = useState(null);
     const [newComment, setNewComment] = useState("");
+    const [editing, setEditing] = useState(false);
 
     const load = useCallback(function () {
       return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(props.taskId)}`)
@@ -657,13 +960,11 @@
     }, [props.taskId]);
 
     useEffect(function () { load(); }, [load]);
-
-    // Escape closes the drawer.
     useEffect(function () {
-      function onKey(e) { if (e.key === "Escape") props.onClose(); }
+      function onKey(e) { if (e.key === "Escape" && !editing) props.onClose(); }
       window.addEventListener("keydown", onKey);
       return function () { window.removeEventListener("keydown", onKey); };
-    }, [props.onClose]);
+    }, [props.onClose, editing]);
 
     const handleComment = function () {
       const body = newComment.trim();
@@ -671,14 +972,52 @@
       SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(props.taskId)}/comments`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ body: body }),
+        body: JSON.stringify({ body }),
       }).then(function () {
         setNewComment("");
         load();
         props.onRefresh();
-      }).catch(function (e) {
-        setErr(String(e.message || e));
-      });
+      }).catch(function (e) { setErr(String(e.message || e)); });
+    };
+
+    const doPatch = function (patch, opts) {
+      if (opts && opts.confirm && !window.confirm(opts.confirm)) {
+        return Promise.resolve();
+      }
+      return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(props.taskId)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      }).then(function () { load(); props.onRefresh(); });
+    };
+
+    const addLink = function (parentId) {
+      return SDK.fetchJSON(`${API}/links`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ parent_id: parentId, child_id: props.taskId }),
+      }).then(function () { load(); props.onRefresh(); })
+        .catch(function (e) { setErr(String(e.message || e)); });
+    };
+    const removeLink = function (parentId) {
+      const qs = new URLSearchParams({ parent_id: parentId, child_id: props.taskId });
+      return SDK.fetchJSON(`${API}/links?${qs}`, { method: "DELETE" })
+        .then(function () { load(); props.onRefresh(); })
+        .catch(function (e) { setErr(String(e.message || e)); });
+    };
+    const addChild = function (childId) {
+      return SDK.fetchJSON(`${API}/links`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ parent_id: props.taskId, child_id: childId }),
+      }).then(function () { load(); props.onRefresh(); })
+        .catch(function (e) { setErr(String(e.message || e)); });
+    };
+    const removeChild = function (childId) {
+      const qs = new URLSearchParams({ parent_id: props.taskId, child_id: childId });
+      return SDK.fetchJSON(`${API}/links?${qs}`, { method: "DELETE" })
+        .then(function () { load(); props.onRefresh(); })
+        .catch(function (e) { setErr(String(e.message || e)); });
     };
 
     return h("div", { className: "hermes-kanban-drawer-shade", onClick: props.onClose },
@@ -698,17 +1037,14 @@
         loading ? h("div", { className: "p-4 text-sm text-muted-foreground" }, "Loading…") :
         err ? h("div", { className: "p-4 text-sm text-destructive" }, err) :
         data ? h(TaskDetail, {
-          data: data,
-          onPatch: function (patch, opts) {
-            if (opts && opts.confirm && !window.confirm(opts.confirm)) {
-              return Promise.resolve();
-            }
-            return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(props.taskId)}`, {
-              method: "PATCH",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(patch),
-            }).then(function () { load(); props.onRefresh(); });
-          },
+          data, editing, setEditing,
+          renderMarkdown: props.renderMarkdown,
+          allTasks: props.allTasks,
+          onPatch: doPatch,
+          onAddParent: addLink,
+          onRemoveParent: removeLink,
+          onAddChild: addChild,
+          onRemoveChild: removeChild,
         }) : null,
         data ? h("div", { className: "hermes-kanban-drawer-comment-row" },
           h(Input, {
@@ -740,15 +1076,24 @@
     return h("div", { className: "hermes-kanban-drawer-body" },
       h("div", { className: "hermes-kanban-drawer-title" },
         h("span", { className: cn("hermes-kanban-dot", COLUMN_DOT[t.status]) }),
-        h("span", null, t.title || "(untitled)"),
+        props.editing
+          ? h(TitleEditor, {
+              initial: t.title || "",
+              onSave: function (newTitle) {
+                return props.onPatch({ title: newTitle }).then(function () { props.setEditing(false); });
+              },
+              onCancel: function () { props.setEditing(false); },
+            })
+          : h("span", {
+              className: "hermes-kanban-drawer-title-text",
+              title: "Click to edit",
+              onClick: function () { props.setEditing(true); },
+            }, t.title || "(untitled)"),
       ),
       h("div", { className: "hermes-kanban-drawer-meta" },
         h(MetaRow, { label: "Status", value: t.status }),
-        h(MetaRow, {
-          label: "Assignee",
-          value: t.assignee || "unassigned",
-        }),
-        h(MetaRow, { label: "Priority", value: String(t.priority) }),
+        h(AssigneeEditor, { task: t, onPatch: props.onPatch }),
+        h(PriorityEditor, { task: t, onPatch: props.onPatch }),
         t.tenant ? h(MetaRow, { label: "Tenant", value: t.tenant }) : null,
         h(MetaRow, {
           label: "Workspace",
@@ -757,29 +1102,22 @@
         t.created_by ? h(MetaRow, { label: "Created by", value: t.created_by }) : null,
       ),
       h(StatusActions, { task: t, onPatch: props.onPatch }),
-      t.body ? h("div", { className: "hermes-kanban-section" },
-        h("div", { className: "hermes-kanban-section-head" }, "Description"),
-        h("pre", { className: "hermes-kanban-pre" }, t.body),
-      ) : null,
-      (links.parents.length > 0 || links.children.length > 0) ?
-        h("div", { className: "hermes-kanban-section" },
-          h("div", { className: "hermes-kanban-section-head" }, "Dependencies"),
-          links.parents.length > 0 ? h("div", { className: "text-xs" },
-            "Parents: ",
-            links.parents.map(function (id) {
-              return h(Badge, { key: id, variant: "outline", className: "ml-1" }, id);
-            }),
-          ) : null,
-          links.children.length > 0 ? h("div", { className: "text-xs mt-1" },
-            "Children: ",
-            links.children.map(function (id) {
-              return h(Badge, { key: id, variant: "outline", className: "ml-1" }, id);
-            }),
-          ) : null,
-        ) : null,
+      h(BodyEditor, {
+        task: t,
+        renderMarkdown: props.renderMarkdown,
+        onPatch: props.onPatch,
+      }),
+      h(DependencyEditor, {
+        task: t,
+        links, allTasks: props.allTasks,
+        onAddParent: props.onAddParent,
+        onRemoveParent: props.onRemoveParent,
+        onAddChild: props.onAddChild,
+        onRemoveChild: props.onRemoveChild,
+      }),
       t.result ? h("div", { className: "hermes-kanban-section" },
         h("div", { className: "hermes-kanban-section-head" }, "Result"),
-        h("pre", { className: "hermes-kanban-pre" }, t.result),
+        h(MarkdownBlock, { source: t.result, enabled: props.renderMarkdown }),
       ) : null,
       h("div", { className: "hermes-kanban-section" },
         h("div", { className: "hermes-kanban-section-head" }, `Comments (${comments.length})`),
@@ -792,7 +1130,7 @@
                   h("span", { className: "hermes-kanban-comment-ago" },
                     timeAgo ? timeAgo(c.created_at) : ""),
                 ),
-                h("pre", { className: "hermes-kanban-pre" }, c.body),
+                h(MarkdownBlock, { source: c.body, enabled: props.renderMarkdown }),
               );
             }),
       ),
@@ -820,6 +1158,232 @@
     );
   }
 
+  function TitleEditor(props) {
+    const [v, setV] = useState(props.initial);
+    const save = function () {
+      const t = v.trim();
+      if (!t) return;
+      props.onSave(t);
+    };
+    return h("div", { className: "hermes-kanban-edit-row" },
+      h(Input, {
+        value: v, autoFocus: true,
+        onChange: function (e) { setV(e.target.value); },
+        onKeyDown: function (e) {
+          if (e.key === "Enter") { e.preventDefault(); save(); }
+          if (e.key === "Escape") props.onCancel();
+        },
+        className: "h-8 text-sm flex-1",
+      }),
+      h(Button, { onClick: save,
+        className: "h-7 px-2 text-xs border border-border hover:bg-foreground/10 cursor-pointer",
+      }, "Save"),
+      h(Button, { onClick: props.onCancel,
+        className: "h-7 px-2 text-xs border border-border hover:bg-foreground/10 cursor-pointer",
+      }, "Cancel"),
+    );
+  }
+
+  function AssigneeEditor(props) {
+    const [editing, setEditing] = useState(false);
+    const [v, setV] = useState(props.task.assignee || "");
+    useEffect(function () { setV(props.task.assignee || ""); }, [props.task.assignee]);
+    if (!editing) {
+      return h("div", { className: "hermes-kanban-meta-row" },
+        h("span", { className: "hermes-kanban-meta-label" }, "Assignee"),
+        h("span", {
+          className: "hermes-kanban-meta-value hermes-kanban-editable",
+          onClick: function () { setEditing(true); },
+          title: "Click to edit",
+        }, props.task.assignee || "unassigned"),
+      );
+    }
+    const save = function () {
+      props.onPatch({ assignee: v.trim() || "" }).then(function () { setEditing(false); });
+    };
+    return h("div", { className: "hermes-kanban-meta-row" },
+      h("span", { className: "hermes-kanban-meta-label" }, "Assignee"),
+      h(Input, {
+        value: v, autoFocus: true,
+        onChange: function (e) { setV(e.target.value); },
+        onKeyDown: function (e) {
+          if (e.key === "Enter") { e.preventDefault(); save(); }
+          if (e.key === "Escape") setEditing(false);
+        },
+        placeholder: "(empty = unassign)",
+        className: "h-7 text-xs flex-1",
+      }),
+    );
+  }
+
+  function PriorityEditor(props) {
+    const [editing, setEditing] = useState(false);
+    const [v, setV] = useState(String(props.task.priority || 0));
+    useEffect(function () { setV(String(props.task.priority || 0)); }, [props.task.priority]);
+    if (!editing) {
+      return h("div", { className: "hermes-kanban-meta-row" },
+        h("span", { className: "hermes-kanban-meta-label" }, "Priority"),
+        h("span", {
+          className: "hermes-kanban-meta-value hermes-kanban-editable",
+          onClick: function () { setEditing(true); },
+          title: "Click to edit",
+        }, String(props.task.priority)),
+      );
+    }
+    const save = function () {
+      props.onPatch({ priority: Number(v) || 0 }).then(function () { setEditing(false); });
+    };
+    return h("div", { className: "hermes-kanban-meta-row" },
+      h("span", { className: "hermes-kanban-meta-label" }, "Priority"),
+      h(Input, {
+        type: "number", value: v, autoFocus: true,
+        onChange: function (e) { setV(e.target.value); },
+        onKeyDown: function (e) {
+          if (e.key === "Enter") { e.preventDefault(); save(); }
+          if (e.key === "Escape") setEditing(false);
+        },
+        className: "h-7 text-xs w-20",
+      }),
+    );
+  }
+
+  function BodyEditor(props) {
+    const [editing, setEditing] = useState(false);
+    const [v, setV] = useState(props.task.body || "");
+    useEffect(function () { setV(props.task.body || ""); }, [props.task.body]);
+    const save = function () {
+      props.onPatch({ body: v }).then(function () { setEditing(false); });
+    };
+    return h("div", { className: "hermes-kanban-section" },
+      h("div", { className: "hermes-kanban-section-head-row" },
+        h("span", { className: "hermes-kanban-section-head" }, "Description"),
+        editing
+          ? h("div", { className: "flex gap-1" },
+              h(Button, { onClick: save,
+                className: "h-6 px-2 text-xs border border-border hover:bg-foreground/10 cursor-pointer",
+              }, "Save"),
+              h(Button, { onClick: function () { setEditing(false); setV(props.task.body || ""); },
+                className: "h-6 px-2 text-xs border border-border hover:bg-foreground/10 cursor-pointer",
+              }, "Cancel"),
+            )
+          : h("button", {
+              type: "button",
+              onClick: function () { setEditing(true); },
+              className: "hermes-kanban-edit-link",
+              title: "Edit description",
+            }, "edit"),
+      ),
+      editing
+        ? h("textarea", {
+            className: "hermes-kanban-textarea",
+            value: v,
+            rows: 8,
+            onChange: function (e) { setV(e.target.value); },
+          })
+        : props.task.body
+          ? h(MarkdownBlock, { source: props.task.body, enabled: props.renderMarkdown })
+          : h("div", { className: "text-xs text-muted-foreground italic" }, "— no description —"),
+    );
+  }
+
+  function DependencyEditor(props) {
+    const { task, links, allTasks } = props;
+    const [newParent, setNewParent] = useState("");
+    const [newChild, setNewChild] = useState("");
+    // Filter out self + existing links when offering the "add" dropdown.
+    const candidatesFor = function (excludeSet) {
+      return (allTasks || []).filter(function (t) {
+        return t.id !== task.id && !excludeSet.has(t.id);
+      });
+    };
+    const parentExclude = new Set([task.id, ...(links.parents || [])]);
+    const childExclude  = new Set([task.id, ...(links.children || [])]);
+
+    return h("div", { className: "hermes-kanban-section" },
+      h("div", { className: "hermes-kanban-section-head" }, "Dependencies"),
+      h("div", { className: "hermes-kanban-deps-row" },
+        h("span", { className: "hermes-kanban-deps-label" }, "Parents:"),
+        h("div", { className: "hermes-kanban-deps-chips" },
+          (links.parents || []).length === 0
+            ? h("span", { className: "hermes-kanban-deps-empty" }, "none")
+            : (links.parents || []).map(function (id) {
+                return h("span", { key: id, className: "hermes-kanban-dep-chip" },
+                  id,
+                  h("button", {
+                    type: "button",
+                    className: "hermes-kanban-dep-chip-x",
+                    onClick: function () { props.onRemoveParent(id); },
+                    title: "Remove dependency",
+                  }, "×"),
+                );
+              }),
+        ),
+      ),
+      h("div", { className: "hermes-kanban-deps-row" },
+        h(Select, {
+          value: newParent,
+          onChange: function (e) { setNewParent(e.target.value); },
+          className: "h-7 text-xs flex-1",
+        },
+          h(SelectOption, { value: "" }, "— add parent —"),
+          candidatesFor(parentExclude).map(function (t) {
+            return h(SelectOption, { key: t.id, value: t.id },
+              `${t.id} — ${(t.title || "").slice(0, 50)}`);
+          }),
+        ),
+        h(Button, {
+          onClick: function () {
+            if (!newParent) return;
+            props.onAddParent(newParent).then(function () { setNewParent(""); });
+          },
+          disabled: !newParent,
+          className: cn("h-7 px-2 text-xs border border-border cursor-pointer",
+            !newParent ? "opacity-40 cursor-not-allowed" : "hover:bg-foreground/10"),
+        }, "+ parent"),
+      ),
+      h("div", { className: "hermes-kanban-deps-row" },
+        h("span", { className: "hermes-kanban-deps-label" }, "Children:"),
+        h("div", { className: "hermes-kanban-deps-chips" },
+          (links.children || []).length === 0
+            ? h("span", { className: "hermes-kanban-deps-empty" }, "none")
+            : (links.children || []).map(function (id) {
+                return h("span", { key: id, className: "hermes-kanban-dep-chip" },
+                  id,
+                  h("button", {
+                    type: "button",
+                    className: "hermes-kanban-dep-chip-x",
+                    onClick: function () { props.onRemoveChild(id); },
+                    title: "Remove dependency",
+                  }, "×"),
+                );
+              }),
+        ),
+      ),
+      h("div", { className: "hermes-kanban-deps-row" },
+        h(Select, {
+          value: newChild,
+          onChange: function (e) { setNewChild(e.target.value); },
+          className: "h-7 text-xs flex-1",
+        },
+          h(SelectOption, { value: "" }, "— add child —"),
+          candidatesFor(childExclude).map(function (t) {
+            return h(SelectOption, { key: t.id, value: t.id },
+              `${t.id} — ${(t.title || "").slice(0, 50)}`);
+          }),
+        ),
+        h(Button, {
+          onClick: function () {
+            if (!newChild) return;
+            props.onAddChild(newChild).then(function () { setNewChild(""); });
+          },
+          disabled: !newChild,
+          className: cn("h-7 px-2 text-xs border border-border cursor-pointer",
+            !newChild ? "opacity-40 cursor-not-allowed" : "hover:bg-foreground/10"),
+        }, "+ child"),
+      ),
+    );
+  }
+
   function StatusActions(props) {
     const t = props.task;
     const b = function (label, patch, enabled, confirmMsg) {
@@ -832,7 +1396,6 @@
         ),
       }, label);
     };
-
     return h("div", { className: "hermes-kanban-actions" },
       b("→ triage",  { status: "triage" },   t.status !== "triage"),
       b("→ ready",   { status: "ready" },    t.status !== "ready"),
