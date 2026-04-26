@@ -436,6 +436,181 @@ const voiceMode = async () => {
   }
 }
 
+// --- Static prompt mocks (no useInput, safe for snap()) ---
+
+const ApprovalPromptStatic = ({
+  command,
+  description,
+  selected = 0,
+  theme
+}: {
+  command: string
+  description: string
+  selected?: number
+  theme: Theme
+}) => {
+  const labels = ['Allow once', 'Allow this session', 'Always allow', 'Deny']
+  const lines = command.split('\n').slice(0, 5)
+
+  return (
+    <Box borderColor={theme.color.warn} borderStyle="double" flexDirection="column" paddingX={1}>
+      <Text bold color={theme.color.warn}>
+        ⚠ approval required · {description}
+      </Text>
+
+      <Box flexDirection="column" paddingLeft={1}>
+        {lines.map((line, i) => (
+          <Text color={theme.color.cornsilk} key={i}>
+            {line || ' '}
+          </Text>
+        ))}
+      </Box>
+
+      <Text />
+
+      {labels.map((label, i) => (
+        <Text key={label}>
+          <Text bold={i === selected} color={i === selected ? theme.color.warn : theme.color.dim} inverse={i === selected}>
+            {i === selected ? '▸ ' : '  '}
+            {i + 1}. {label}
+          </Text>
+        </Text>
+      ))}
+
+      <Text color={theme.color.dim}>↑/↓ select · Enter confirm · 1-4 quick pick · Ctrl+C deny</Text>
+    </Box>
+  )
+}
+
+const ClarifyPromptStatic = ({
+  choices,
+  question,
+  selected = 0,
+  theme
+}: {
+  choices: string[]
+  question: string
+  selected?: number
+  theme: Theme
+}) => (
+  <Box flexDirection="column">
+    <Text bold>
+      <Text color={theme.color.amber}>ask</Text>
+      <Text color={theme.color.cornsilk}> {question}</Text>
+    </Text>
+
+    {[...choices, 'Other (type your answer)'].map((c, i) => (
+      <Text key={i}>
+        <Text bold={i === selected} color={i === selected ? theme.color.label : theme.color.dim} inverse={i === selected}>
+          {i === selected ? '▸ ' : '  '}
+          {i + 1}. {c}
+        </Text>
+      </Text>
+    ))}
+
+    <Text color={theme.color.dim}>
+      ↑/↓ select · Enter confirm · 1-{choices.length + 1} quick pick · Esc cancel
+    </Text>
+  </Box>
+)
+
+const interactivePrompts = async () => {
+  // User asks for something that triggers approval
+  const userAsk = await snap(
+    <Msg role="user" text="Run npm install express in the project root." />
+  )
+
+  const assistantExplains = await snap(
+    <Msg
+      role="assistant"
+      text="I'll install express. The package manager needs approval — here's the command."
+    />
+  )
+
+  // Approval prompt
+  const approval = await snap(
+    <ApprovalPromptStatic
+      command={'npm install express\nadded 58 packages in 3.2s\n\n+ express@5.1.0'}
+      description="install dependency"
+      theme={t}
+    />,
+    180
+  )
+
+  // After approval, user asks something ambiguous
+  const userClarify = await snap(
+    <Msg role="user" text="Deploy this to staging." />
+  )
+
+  const assistantAsks = await snap(
+    <Msg role="assistant" text="Which environment should I target?" />
+  )
+
+  // Clarify prompt
+  const clarify = await snap(
+    <ClarifyPromptStatic
+      choices={['staging-us-east', 'staging-eu-west', 'staging-ap-south']}
+      question="Which region?"
+      theme={t}
+    />,
+    180
+  )
+
+  const confirmResult = await snap(
+    <Panel
+      sections={[
+        {
+          rows: [
+            ['target', 'staging-us-east'],
+            ['branch', 'main'],
+            ['preview', 'https://pr-128.railway.app']
+          ]
+        }
+      ]}
+      t={t}
+      title="deployment queued"
+    />,
+    180
+  )
+
+  return {
+    composer: 'deploy this to staging',
+    timeline: [
+      { ansi: userAsk, at: 200, id: 'ask', type: 'frame' },
+      { ansi: assistantExplains, at: 1200, id: 'explain', type: 'frame' },
+      { ansi: approval, at: 2600, id: 'approval', type: 'frame' },
+      { at: 2900, duration: 1500, target: 'approval', type: 'spotlight' },
+      {
+        at: 3100,
+        duration: 2000,
+        position: 'right',
+        target: 'approval',
+        text: 'Approval prompts gate dangerous commands. Four options: allow once, session, always, deny.',
+        type: 'caption'
+      },
+      { at: 5400, duration: 400, text: '1', type: 'compose' },
+      { at: 5900, duration: 500, text: '', type: 'compose' },
+      { ansi: userClarify, at: 6600, id: 'clarify-ask', type: 'frame' },
+      { ansi: assistantAsks, at: 7600, id: 'clarify-reply', type: 'frame' },
+      { ansi: clarify, at: 8800, id: 'clarify', type: 'frame' },
+      { at: 9100, duration: 1500, target: 'clarify', type: 'spotlight' },
+      {
+        at: 9300,
+        duration: 2000,
+        position: 'right',
+        target: 'clarify',
+        text: 'Clarify prompts handle ambiguous requests — numbered choices or free text.',
+        type: 'caption'
+      },
+      { at: 11600, duration: 400, text: '1', type: 'compose' },
+      { ansi: confirmResult, at: 12200, id: 'result', type: 'frame' },
+      { at: 12500, duration: 1300, target: 'result', type: 'highlight' }
+    ],
+    title: 'Hermes TUI · Interactive Prompts',
+    viewport: { cols: COLS, rows: ROWS }
+  }
+}
+
 const main = async () => {
   console.log('recording workflows…')
 
@@ -447,6 +622,7 @@ const main = async () => {
     'subagent-trail.json',
     'slash-commands.json',
     'voice-mode.json',
+    'interactive-prompts.json',
     'ink-frames.json'
   ]) {
     try {
@@ -460,6 +636,7 @@ const main = async () => {
   writeWorkflow('subagent-trail', await subagentTrail())
   writeWorkflow('slash-commands', await slashCommands())
   writeWorkflow('voice-mode', await voiceMode())
+  writeWorkflow('interactive-prompts', await interactivePrompts())
 
   console.log('done')
 }

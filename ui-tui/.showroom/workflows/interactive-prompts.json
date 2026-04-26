@@ -1,0 +1,104 @@
+{
+  "composer": "deploy this to staging",
+  "timeline": [
+    {
+      "ansi": "\u001b[?25l\u001b[?2026h\r\n❯\u001b[2CRun\u001b[1Cnpm\u001b[1Cinstall\u001b[1Cexpress\u001b[1Cin\u001b[1Cthe\u001b[1Cproject\u001b[1Croot.\r\n\r\n\u001b[?2026l\u001b[?2026h\u001b[?25h\u001b[?2026l\u001b[?25h",
+      "at": 200,
+      "id": "ask",
+      "type": "frame"
+    },
+    {
+      "ansi": "\u001b[?25l\u001b[?2026h┊\u001b[2CI'll\u001b[1Cinstall\u001b[1Cexpress.\u001b[1CThe\u001b[1Cpackage\u001b[1Cmanager\u001b[1Cneeds\u001b[1Capproval\u001b[1C—\u001b[1Chere's\u001b[1Cthe\r\n\u001b[3Ccommand.\r\n\u001b[?2026l\u001b[?2026h\u001b[?25h\u001b[?2026l\u001b[?25h",
+      "at": 1200,
+      "id": "explain",
+      "type": "frame"
+    },
+    {
+      "ansi": "\u001b[?25l\u001b[?2026h╔══════════════════════════════════════════════════════════════════════════════╗\r\n║\u001b[1C⚠\u001b[1Capproval\u001b[1Crequired\u001b[1C·\u001b[1Cinstall\u001b[1Cdependency\u001b[36C║\r\n║\u001b[2Cnpm\u001b[1Cinstall\u001b[1Cexpress\u001b[57C║\r\n║\u001b[2Cadded\u001b[1C58\u001b[1Cpackages\u001b[1Cin\u001b[1C3.2s\u001b[51C║\r\n║\u001b[78C║\r\n║\u001b[2C+\u001b[1Cexpress@5.1.0\u001b[61C║\r\n║\u001b[1C▸\u001b[1C1.\u001b[1CAllow\u001b[1Conce\u001b[62C║\r\n║\u001b[3C2.\u001b[1CAllow\u001b[1Cthis\u001b[1Csession\u001b[54C║\r\n║\u001b[3C3.\u001b[1CAlways\u001b[1Callow\u001b[60C║\r\n║\u001b[3C4.\u001b[1CDeny\u001b[68C║\r\n║\u001b[1C↑/↓\u001b[1Cselect\u001b[1C·\u001b[1CEnter\u001b[1Cconfirm\u001b[1C·\u001b[1C1-4\u001b[1Cquick\u001b[1Cpick\u001b[1C·\u001b[1CCtrl+C\u001b[1Cdeny\u001b[20C║\r\n╚══════════════════════════════════════════════════════════════════════════════╝\r\n\u001b[?2026l\u001b[?2026h\u001b[?25h\u001b[?2026l\u001b[?25h",
+      "at": 2600,
+      "id": "approval",
+      "type": "frame"
+    },
+    {
+      "at": 2900,
+      "duration": 1500,
+      "target": "approval",
+      "type": "spotlight"
+    },
+    {
+      "at": 3100,
+      "duration": 2000,
+      "position": "right",
+      "target": "approval",
+      "text": "Approval prompts gate dangerous commands. Four options: allow once, session, always, deny.",
+      "type": "caption"
+    },
+    {
+      "at": 5400,
+      "duration": 400,
+      "text": "1",
+      "type": "compose"
+    },
+    {
+      "at": 5900,
+      "duration": 500,
+      "text": "",
+      "type": "compose"
+    },
+    {
+      "ansi": "\u001b[?25l\u001b[?2026h\r\n❯\u001b[2CDeploy\u001b[1Cthis\u001b[1Cto\u001b[1Cstaging.\r\n\r\n\u001b[?2026l\u001b[?2026h\u001b[?25h\u001b[?2026l\u001b[?25h",
+      "at": 6600,
+      "id": "clarify-ask",
+      "type": "frame"
+    },
+    {
+      "ansi": "\u001b[?25l\u001b[?2026h┊\u001b[2CWhich\u001b[1Cenvironment\u001b[1Cshould\u001b[1CI\u001b[1Ctarget?\r\n\u001b[?2026l\u001b[?2026h\u001b[?25h\u001b[?2026l\u001b[?25h",
+      "at": 7600,
+      "id": "clarify-reply",
+      "type": "frame"
+    },
+    {
+      "ansi": "\u001b[?25l\u001b[?2026hask\u001b[1CWhich\u001b[1Cregion?\r\n▸\u001b[1C1.\u001b[1Cstaging-us-east\r\n\u001b[2C2.\u001b[1Cstaging-eu-west\r\n\u001b[2C3.\u001b[1Cstaging-ap-south\r\n\u001b[2C4.\u001b[1COther\u001b[1C(type\u001b[1Cyour\u001b[1Canswer)\r\n↑/↓\u001b[1Cselect\u001b[1C·\u001b[1CEnter\u001b[1Cconfirm\u001b[1C·\u001b[1C1-4\u001b[1Cquick\u001b[1Cpick\u001b[1C·\u001b[1CEsc\u001b[1Ccancel\r\n\u001b[?2026l\u001b[?2026h\u001b[?25h\u001b[?2026l\u001b[?25h",
+      "at": 8800,
+      "id": "clarify",
+      "type": "frame"
+    },
+    {
+      "at": 9100,
+      "duration": 1500,
+      "target": "clarify",
+      "type": "spotlight"
+    },
+    {
+      "at": 9300,
+      "duration": 2000,
+      "position": "right",
+      "target": "clarify",
+      "text": "Clarify prompts handle ambiguous requests — numbered choices or free text.",
+      "type": "caption"
+    },
+    {
+      "at": 11600,
+      "duration": 400,
+      "text": "1",
+      "type": "compose"
+    },
+    {
+      "ansi": "\u001b[?25l\u001b[?2026h╭──────────────────────────────────────────────────────────────────────────────╮\r\n│\u001b[78C│\r\n│\u001b[30Cdeployment\u001b[1Cqueued\u001b[31C│\r\n│\u001b[78C│\r\n│\u001b[2Ctarget\u001b[14Cstaging-us-east\u001b[41C│\r\n│\u001b[2Cbranch\u001b[14Cmain\u001b[52C│\r\n│\u001b[2Cpreview\u001b[13Chttps://pr-128.railway.app\u001b[30C│\r\n│\u001b[78C│\r\n╰──────────────────────────────────────────────────────────────────────────────╯\r\n\u001b[?2026l\u001b[?2026h\u001b[?25h\u001b[?2026l\u001b[?25h",
+      "at": 12200,
+      "id": "result",
+      "type": "frame"
+    },
+    {
+      "at": 12500,
+      "duration": 1300,
+      "target": "result",
+      "type": "highlight"
+    }
+  ],
+  "title": "Hermes TUI · Interactive Prompts",
+  "viewport": {
+    "cols": 80,
+    "rows": 16
+  }
+}
