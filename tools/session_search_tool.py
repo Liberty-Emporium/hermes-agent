@@ -2,19 +2,16 @@
 """
 Session Search Tool - Long-Term Conversation Recall
 
-Searches past session transcripts in SQLite via FTS5, then summarizes the top
-matching sessions using the configured auxiliary session_search model (same
-pattern as web_extract). By default, auxiliary "auto" routing uses the main
-chat provider/model unless the user overrides auxiliary.session_search.
-Returns focused summaries of past conversations rather than raw transcripts,
-keeping the main model's context window clean.
+Searches past session transcripts in SQLite via FTS5. Keyword search defaults
+to fast snippet/context hits without any LLM call; callers can opt into focused
+LLM summaries with mode="summary" when deeper recall is worth the latency.
 
 Flow:
   1. FTS5 search finds matching messages ranked by relevance
   2. Groups by session, takes the top N unique sessions (default 3)
-  3. Loads each session's conversation, truncates to ~100k chars centered on matches
-  4. Sends to the configured auxiliary model with a focused summarization prompt
-  5. Returns per-session summaries with metadata
+  3. Fast mode returns snippets and nearby context immediately
+  4. Summary mode loads each session, truncates around matches, and calls an LLM
+  5. Returns per-session hits/summaries with metadata
 """
 
 import asyncio
@@ -328,13 +325,11 @@ def session_search(
     limit: int = 3,
     db=None,
     current_session_id: str = None,
+    mode: str = "fast",
 ) -> str:
     """
-    Search past sessions and return focused summaries of matching conversations.
-
-    Uses FTS5 to find matches, then summarizes the top sessions with the
-    configured auxiliary session_search model.
-    The current session is excluded from results since the agent already has that context.
+    Search past sessions. Fast mode returns FTS snippets without LLM calls;
+    summary mode preserves the previous focused summarization behavior.
     """
     if db is None:
         try:
@@ -345,6 +340,12 @@ def session_search(
             logging.debug("SessionDB unavailable for session_search", exc_info=True)
             from hermes_state import format_session_db_unavailable
             return tool_error(format_session_db_unavailable(), success=False)
+
+    mode = (mode or "fast").strip().lower() if isinstance(mode, str) else "fast"
+    if mode in ("summarized", "summarise", "summarize", "deep"):
+        mode = "summary"
+    if mode not in ("fast", "summary"):
+        mode = "fast"
 
     # Defensive: models (especially open-source) may send non-int limit values
     # (None when JSON null, string "int", or even a type object).  Coerce to a
@@ -381,6 +382,7 @@ def session_search(
         if not raw_results:
             return json.dumps({
                 "success": True,
+                "mode": mode,
                 "query": query,
                 "results": [],
                 "count": 0,
@@ -437,6 +439,41 @@ def session_search(
                 seen_sessions[resolved_sid] = result
             if len(seen_sessions) >= limit:
                 break
+
+        if mode == "fast":
+            results = []
+            for session_id, match_info in seen_sessions.items():
+                try:
+                    session_meta = db.get_session(session_id) or {}
+                except Exception:
+                    session_meta = {}
+                snippet = match_info.get("snippet") or ""
+                context = match_info.get("context") or []
+                if not isinstance(context, list):
+                    context = []
+                results.append({
+                    "session_id": session_id,
+                    "when": _format_timestamp(
+                        session_meta.get("started_at") or match_info.get("session_started")
+                    ),
+                    "source": session_meta.get("source") or match_info.get("source", "unknown"),
+                    "model": session_meta.get("model") or match_info.get("model") or "unknown",
+                    "matched_role": match_info.get("role"),
+                    "title": session_meta.get("title") or None,
+                    "snippet": snippet,
+                    "context": context,
+                    "summary": "[Search hit — summary not generated in fast mode] Use snippet/context fields, or set mode='summary' for LLM-generated recall.",
+                })
+
+            return json.dumps({
+                "success": True,
+                "mode": "fast",
+                "query": query,
+                "results": results,
+                "count": len(results),
+                "sessions_searched": len(seen_sessions),
+                "message": "Fast search returned FTS snippets without LLM summarization. Use mode='summary' for focused summaries when needed.",
+            }, ensure_ascii=False)
 
         # Prepare all sessions for parallel summarization
         tasks = []
@@ -527,6 +564,7 @@ def session_search(
 
         return json.dumps({
             "success": True,
+            "mode": "summary",
             "query": query,
             "results": summaries,
             "count": len(summaries),
@@ -539,7 +577,7 @@ def session_search(
 
 
 def check_session_search_requirements() -> bool:
-    """Requires SQLite state database and an auxiliary text model."""
+    """Requires SQLite state database; summary mode also needs an auxiliary model."""
     try:
         from hermes_state import DEFAULT_DB_PATH
         return DEFAULT_DB_PATH.parent.exists()
@@ -551,13 +589,14 @@ SESSION_SEARCH_SCHEMA = {
     "name": "session_search",
     "description": (
         "Search your long-term memory of past conversations, or browse recent sessions. This is your recall -- "
-        "every past session is searchable, and this tool summarizes what happened.\n\n"
+        "every past session is searchable. Keyword search defaults to fast FTS snippets with no LLM call.\n\n"
         "TWO MODES:\n"
         "1. Recent sessions (no query): Call with no arguments to see what was worked on recently. "
         "Returns titles, previews, and timestamps. Zero LLM cost, instant. "
         "Start here when the user asks what were we working on or what did we do recently.\n"
         "2. Keyword search (with query): Search for specific topics across all past sessions. "
-        "Returns LLM-generated summaries of matching sessions.\n\n"
+        "Defaults to mode='fast', returning snippets and nearby context instantly without LLM summarization. "
+        "Use mode='summary' only when a focused LLM-generated recap is worth the latency.\n\n"
         "USE THIS PROACTIVELY when:\n"
         "- The user says 'we did this before', 'remember when', 'last time', 'as I mentioned'\n"
         "- The user asks about a topic you worked on before but don't have in current context\n"
@@ -570,7 +609,7 @@ SESSION_SEARCH_SCHEMA = {
         "phrases for exact match (\"docker networking\"), boolean (python NOT java), prefix (deploy*). "
         "IMPORTANT: Use OR between keywords for best results — FTS5 defaults to AND which misses "
         "sessions that only mention some terms. If a broad OR query returns nothing, try individual "
-        "keyword searches in parallel. Returns summaries of the top matching sessions."
+        "keyword searches in parallel. Returns fast search hits by default."
     ),
     "parameters": {
         "type": "object",
@@ -585,8 +624,14 @@ SESSION_SEARCH_SCHEMA = {
             },
             "limit": {
                 "type": "integer",
-                "description": "Max sessions to summarize (default: 3, max: 5).",
+                "description": "Max sessions to return (default: 3, max: 5).",
                 "default": 3,
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["fast", "summary"],
+                "description": "fast (default) returns FTS snippets + surrounding context without LLM calls (~0.02s). Start here for most recall needs. summary loads the full session transcript and runs the LLM summarizer (~10-30s). Use summary only when the fast results do not give enough context to answer the user's question, or when the user explicitly asks for a 'summary' or 'recap' of past conversations. You can call twice: first fast, then summary if more detail is needed.",
+                "default": "fast",
             },
         },
         "required": [],
@@ -605,6 +650,7 @@ registry.register(
         query=args.get("query") or "",
         role_filter=args.get("role_filter"),
         limit=args.get("limit", 3),
+        mode=args.get("mode", "fast"),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id")),
     check_fn=check_session_search_requirements,

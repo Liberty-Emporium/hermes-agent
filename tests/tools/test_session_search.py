@@ -234,9 +234,10 @@ class TestSessionSearchConcurrency:
             {"role": "assistant", "content": "response"},
         ]
 
-        result = json.loads(session_search(query="message", db=mock_db, limit=3))
+        result = json.loads(session_search(query="message", db=mock_db, limit=3, mode="summary"))
 
         assert result["success"] is True
+        assert result["mode"] == "summary"
         assert result["count"] == 3
         assert max_seen["value"] == 1
 
@@ -399,6 +400,165 @@ class TestSessionSearch:
         # Current session should be skipped, only other_sid should appear
         assert result["sessions_searched"] == 1
         assert current_sid not in [r.get("session_id") for r in result.get("results", [])]
+
+    def test_default_search_returns_fast_hits_without_llm_or_full_session_load(self, monkeypatch):
+        """Default keyword search should stay on the DB/snippet path and avoid LLM latency."""
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        async def fail_summarize(*_args, **_kwargs):
+            raise AssertionError("default session_search must not call the summarizer")
+
+        monkeypatch.setattr("tools.session_search_tool._summarize_session", fail_summarize)
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {
+                "id": 123,
+                "session_id": "other_sid",
+                "role": "user",
+                "snippet": "we discussed >>>session_search<<< latency",
+                "context": [
+                    {"role": "user", "content": "session_search is slow"},
+                    {"role": "assistant", "content": "the LLM summary is the bottleneck"},
+                ],
+                "source": "cli",
+                "session_started": 1709400000,
+                "model": "test-model",
+            },
+        ]
+        mock_db.get_session.return_value = {"parent_session_id": None, "title": "Latency debug"}
+
+        result = json.loads(session_search(query="session_search", db=mock_db))
+
+        assert result["success"] is True
+        assert result["mode"] == "fast"
+        assert result["count"] == 1
+        entry = result["results"][0]
+        assert entry["summary"] == "[Search hit — summary not generated in fast mode] Use snippet/context fields, or set mode='summary' for LLM-generated recall."
+        assert "we discussed" not in entry["summary"]
+        assert entry["model"] == "test-model"
+        assert entry["snippet"] == "we discussed >>>session_search<<< latency"
+        assert entry["context"][1]["content"] == "the LLM summary is the bottleneck"
+        mock_db.get_messages_as_conversation.assert_not_called()
+
+    @pytest.mark.parametrize("mode", ["summarized", "summarise", "summarize", "deep"])
+    def test_summary_mode_aliases_use_llm_summarization_path(self, monkeypatch, mode):
+        """Common natural-language mode aliases should map to summary mode."""
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        async def fake_summarize(_text, _query, _meta):
+            return "alias summary"
+
+        monkeypatch.setattr("tools.session_search_tool._summarize_session", fake_summarize)
+        monkeypatch.setattr("model_tools._run_async", lambda coro: asyncio.run(coro))
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [{"session_id": "sid", "source": "cli"}]
+        mock_db.get_session.return_value = {"parent_session_id": None, "source": "cli"}
+        mock_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "full transcript"},
+        ]
+
+        result = json.loads(session_search(query="session_search", db=mock_db, mode=mode))
+
+        assert result["success"] is True
+        assert result["mode"] == "summary"
+        assert result["results"][0]["summary"] == "alias summary"
+
+    @pytest.mark.parametrize("mode", ["", "unknown", 42, True, None])
+    def test_invalid_or_empty_mode_falls_back_to_fast_without_llm(self, monkeypatch, mode):
+        """Loose tool-call args should degrade to fast mode rather than crashing."""
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        async def fail_summarize(*_args, **_kwargs):
+            raise AssertionError("invalid modes should fall back to fast mode")
+
+        monkeypatch.setattr("tools.session_search_tool._summarize_session", fail_summarize)
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {"session_id": "sid", "snippet": "hit", "context": "not-a-list", "source": "cli"},
+        ]
+        mock_db.get_session.return_value = {"parent_session_id": None}
+
+        result = json.loads(session_search(query="session_search", db=mock_db, mode=mode))
+
+        assert result["success"] is True
+        assert result["mode"] == "fast"
+        assert result["results"][0]["context"] == []
+        assert result["results"][0]["model"] == "unknown"
+        mock_db.get_messages_as_conversation.assert_not_called()
+
+    def test_fast_mode_tolerates_session_metadata_lookup_failure(self):
+        """Fast mode should still return the FTS hit when parent metadata is unavailable."""
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {"session_id": "sid", "snippet": "hit", "source": "cli", "model": None},
+        ]
+        mock_db.get_session.side_effect = RuntimeError("metadata unavailable")
+
+        result = json.loads(session_search(query="session_search", db=mock_db))
+
+        assert result["success"] is True
+        assert result["results"][0]["source"] == "cli"
+        assert result["results"][0]["model"] == "unknown"
+
+    def test_summary_mode_preserves_llm_summarization_path(self, monkeypatch):
+        """Explicit summary mode keeps the previous behavior for deeper recall."""
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        async def fake_summarize(text, query, meta):
+            assert "full transcript" in text
+            assert query == "session_search"
+            assert meta["source"] == "cli"
+            return "focused session summary"
+
+        monkeypatch.setattr("tools.session_search_tool._summarize_session", fake_summarize)
+        monkeypatch.setattr("model_tools._run_async", lambda coro: asyncio.run(coro))
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {"session_id": "other_sid", "source": "cli", "session_started": 1709400000, "model": "test-model"},
+        ]
+        mock_db.get_session.return_value = {"parent_session_id": None, "source": "cli", "started_at": 1709400000}
+        mock_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "full transcript about session_search"},
+        ]
+
+        result = json.loads(session_search(query="session_search", db=mock_db, mode="summary"))
+
+        assert result["success"] is True
+        assert result["mode"] == "summary"
+        assert result["results"][0]["summary"] == "focused session summary"
+        mock_db.get_messages_as_conversation.assert_called_once_with("other_sid")
+
+    def test_positional_db_argument_remains_backwards_compatible(self):
+        """Keep the historical positional order: query, role_filter, limit, db, current_session_id."""
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = []
+
+        result = json.loads(session_search("session_search", None, 3, mock_db, None))
+
+        assert result["success"] is True
+        assert result["mode"] == "fast"
+        mock_db.search_messages.assert_called_once()
+
+    def test_run_agent_special_session_search_paths_forward_mode(self):
+        """run_agent has two direct session_search call sites outside registry dispatch."""
+        from pathlib import Path
+
+        source = (Path(__file__).parent.parent.parent / "run_agent.py").read_text()
+        assert source.count('mode=function_args.get("mode", "fast")') == 2
 
     def test_current_child_session_excludes_parent_lineage(self):
         """Compression/delegation parents should be excluded for the active child session."""
