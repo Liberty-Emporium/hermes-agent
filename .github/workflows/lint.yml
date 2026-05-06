@@ -48,12 +48,16 @@ jobs:
 
       - name: Determine base ref
         id: base
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          # For PRs, diff against the merge base with the target branch.
+          # For PRs, diff against the PR's pinned parent commit
+          # (github.event.pull_request.base.sha — snapshot at PR open time,
+          # so later pushes to main don't leak into the diff).
           # For pushes to main, diff against the previous commit on main.
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            BASE_SHA=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
-            BASE_REF="origin/${{ github.base_ref }}"
+            BASE_SHA="${PR_BASE_SHA}"
+            BASE_REF="PR base (${BASE_SHA:0:7})"
           else
             BASE_SHA=$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)
             BASE_REF="HEAD~1"
