@@ -325,11 +325,11 @@ def session_search(
     limit: int = 3,
     db=None,
     current_session_id: str = None,
-    mode: str = "fast",
+    mode: str = "summary",
 ) -> str:
     """
-    Search past sessions. Fast mode returns FTS snippets without LLM calls;
-    summary mode preserves the previous focused summarization behavior.
+    Search past sessions. Summary mode (default) returns LLM-generated recaps;
+    fast mode returns FTS snippets without LLM calls for cheap discovery.
     """
     if db is None:
         try:
@@ -341,11 +341,11 @@ def session_search(
             from hermes_state import format_session_db_unavailable
             return tool_error(format_session_db_unavailable(), success=False)
 
-    mode = (mode or "fast").strip().lower() if isinstance(mode, str) else "fast"
+    mode = (mode or "summary").strip().lower() if isinstance(mode, str) else "summary"
     if mode in ("summarized", "summarise", "summarize", "deep"):
         mode = "summary"
     if mode not in ("fast", "summary"):
-        mode = "fast"
+        mode = "summary"
 
     # Defensive: models (especially open-source) may send non-int limit values
     # (None when JSON null, string "int", or even a type object).  Coerce to a
@@ -589,27 +589,28 @@ SESSION_SEARCH_SCHEMA = {
     "name": "session_search",
     "description": (
         "Search your long-term memory of past conversations, or browse recent sessions. This is your recall -- "
-        "every past session is searchable. Keyword search defaults to fast FTS snippets with no LLM call.\n\n"
+        "every past session is searchable.\n\n"
         "TWO MODES:\n"
         "1. Recent sessions (no query): Call with no arguments to see what was worked on recently. "
         "Returns titles, previews, and timestamps. Zero LLM cost, instant. "
         "Start here when the user asks what were we working on or what did we do recently.\n"
         "2. Keyword search (with query): Search for specific topics across all past sessions. "
-        "Defaults to mode='fast', returning snippets and nearby context instantly without LLM summarization. "
-        "Use mode='summary' only when a focused LLM-generated recap is worth the latency.\n\n"
+        "Defaults to mode='summary', returning LLM-generated recaps of the matched sessions (the recall "
+        "you usually want). Set mode='fast' for cheap, instant FTS snippet hits when you only need to "
+        "discover which sessions touched a topic.\n\n"
         "USE THIS PROACTIVELY when:\n"
         "- The user says 'we did this before', 'remember when', 'last time', 'as I mentioned'\n"
         "- The user asks about a topic you worked on before but don't have in current context\n"
         "- The user references a project, person, or concept that seems familiar but isn't in memory\n"
         "- You want to check if you've solved a similar problem before\n"
         "- The user asks 'what did we do about X?' or 'how did we fix Y?'\n\n"
-        "Don't hesitate to search when it is actually cross-session -- it's fast and cheap. "
+        "Don't hesitate to search when it is actually cross-session -- summary mode is one tool call away. "
         "Better to search and confirm than to guess or ask the user to repeat themselves.\n\n"
         "Search syntax: keywords joined with OR for broad recall (elevenlabs OR baseten OR funding), "
         "phrases for exact match (\"docker networking\"), boolean (python NOT java), prefix (deploy*). "
         "IMPORTANT: Use OR between keywords for best results — FTS5 defaults to AND which misses "
         "sessions that only mention some terms. If a broad OR query returns nothing, try individual "
-        "keyword searches in parallel. Returns fast search hits by default."
+        "keyword searches in parallel."
     ),
     "parameters": {
         "type": "object",
@@ -630,8 +631,20 @@ SESSION_SEARCH_SCHEMA = {
             "mode": {
                 "type": "string",
                 "enum": ["fast", "summary"],
-                "description": "fast (default) returns FTS snippets + surrounding context without LLM calls (~0.02s). Start here for most recall needs. summary loads the full session transcript and runs the LLM summarizer (~10-30s). Use summary only when the fast results do not give enough context to answer the user's question, or when the user explicitly asks for a 'summary' or 'recap' of past conversations. You can call twice: first fast, then summary if more detail is needed.",
-                "default": "fast",
+                "description": (
+                    "summary (default) loads each matched session's transcript and runs the LLM "
+                    "summariser to produce a focused recap — ~30s, ~3-4 KB returned per session, "
+                    "surfaces cross-session synthesis (e.g. references to work sessions that didn't "
+                    "themselves match FTS5). Use this when the user wants to know WHAT HAPPENED in "
+                    "past sessions about a topic. "
+                    "fast returns FTS5 snippets + 1-message context without any LLM call — ~10ms, "
+                    "~1 KB per session, surfaces only what FTS5 directly matched. Use this when the "
+                    "user only needs to discover WHICH SESSIONS touched a topic, or when you'll "
+                    "drill into specific sessions yourself afterwards. "
+                    "If a fast result looks promising but lacks detail, you can call again with "
+                    "mode='summary' on the same query."
+                ),
+                "default": "summary",
             },
         },
         "required": [],
@@ -650,7 +663,7 @@ registry.register(
         query=args.get("query") or "",
         role_filter=args.get("role_filter"),
         limit=args.get("limit", 3),
-        mode=args.get("mode", "fast"),
+        mode=args.get("mode", "summary"),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id")),
     check_fn=check_session_search_requirements,
