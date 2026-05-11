@@ -1,6 +1,7 @@
 import type { ThreadMessageLike } from '@assistant-ui/react'
 
 import { mediaDisplayLabel, mediaMarkdownHref } from '@/lib/media'
+import { parseTodos } from '@/lib/todos'
 import type { SessionMessage, UsageStats } from '@/types/hermes'
 
 export type ChatMessagePart = Exclude<ThreadMessageLike['content'], string>[number]
@@ -211,21 +212,42 @@ function toolId(payload: GatewayEventPayload | undefined): string {
   return payload?.tool_id || payload?.name || `tool-${Date.now()}`
 }
 
-function toolArgs(payload: GatewayEventPayload | undefined): Record<string, unknown> {
+// Carry todo state across sparse progress payloads: if this todo event lacks
+// a `todos` field, fall back to whatever we previously stored on the part.
+function carryTodos(payload: GatewayEventPayload | undefined, ...prev: unknown[]): { todos: unknown } | undefined {
+  if (payload && Object.hasOwn(payload, 'todos')) {
+    const next = parseTodos(payload.todos)
+
+    return next === null ? undefined : { todos: next }
+  }
+
+  if (payload?.name !== 'todo') {return undefined}
+
+  for (const p of prev) {
+    const carried = parseTodos(recordFromUnknown(p)?.todos)
+
+    if (carried !== null) {return { todos: carried }}
+  }
+
+  return undefined
+}
+
+function toolArgs(payload: GatewayEventPayload | undefined, prevArgs?: unknown): Record<string, unknown> {
   return {
     ...(payload?.context ? { context: payload.context } : {}),
-    ...(payload?.preview ? { preview: payload.preview } : {})
+    ...(payload?.preview ? { preview: payload.preview } : {}),
+    ...carryTodos(payload, prevArgs)
   }
 }
 
-function toolResult(payload: GatewayEventPayload | undefined): Record<string, unknown> {
+function toolResult(payload: GatewayEventPayload | undefined, prevResult?: unknown, prevArgs?: unknown): Record<string, unknown> {
   return {
     ...(payload?.inline_diff ? { inline_diff: payload.inline_diff } : {}),
     ...(payload?.summary ? { summary: payload.summary } : {}),
     ...(payload?.message ? { message: payload.message } : {}),
     ...(payload?.preview ? { preview: payload.preview } : {}),
     ...(payload?.duration_s !== undefined ? { duration_s: payload.duration_s } : {}),
-    ...(payload?.todos ? { todos: payload.todos } : {}),
+    ...carryTodos(payload, prevResult, prevArgs),
     ...(payload?.error ? { error: payload.error } : {})
   }
 }
@@ -243,24 +265,21 @@ export function upsertToolPart(
     part => part.type === 'tool-call' && ((part.toolCallId && part.toolCallId === id) || part.toolName === name)
   )
 
+  const prev = index >= 0 ? next[index] : null
+  const prevArgs = prev && 'args' in prev ? prev.args : undefined
+  const prevResult = prev && 'result' in prev ? prev.result : undefined
+  const args = toolArgs(payload, prevArgs)
+
   const base = {
     type: 'tool-call' as const,
     toolCallId: id,
     toolName: name,
-    args: toolArgs(payload) as never,
-    argsText: JSON.stringify(toolArgs(payload)),
-    ...(phase === 'complete'
-      ? {
-          result: toolResult(payload),
-          isError: Boolean(payload?.error)
-        }
-      : {})
+    args: args as never,
+    argsText: JSON.stringify(args),
+    ...(phase === 'complete' && { result: toolResult(payload, prevResult, prevArgs), isError: Boolean(payload?.error) })
   } satisfies ChatMessagePart
 
-  if (index === -1) {
-    return [...next, base]
-  }
-
+  if (index === -1) {return [...next, base]}
   next[index] = { ...next[index], ...base }
 
   return next
@@ -457,20 +476,48 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
   const result: ChatMessage[] = []
   let pendingToolParts: ChatMessagePart[] = []
   let pendingToolTimestamp: number | undefined
+  let activeAssistantIndex: null | number = null
+
+  const clearPendingTools = () => {
+    pendingToolParts = []
+    pendingToolTimestamp = undefined
+  }
+
+  const appendPartsToActiveAssistant = (parts: ChatMessagePart[], timestamp?: number): boolean => {
+    if (activeAssistantIndex === null) {
+      return false
+    }
+
+    const active = result[activeAssistantIndex]
+
+    if (!active || active.role !== 'assistant') {
+      activeAssistantIndex = null
+
+      return false
+    }
+
+    active.parts = [...active.parts, ...parts]
+    active.timestamp = timestamp ?? active.timestamp
+
+    return true
+  }
 
   const flushPendingTools = (index: number) => {
     if (!pendingToolParts.length) {
       return
     }
 
-    result.push({
-      id: `${pendingToolTimestamp || Date.now()}-${index}-tools`,
-      role: 'assistant',
-      parts: pendingToolParts,
-      timestamp: pendingToolTimestamp
-    })
-    pendingToolParts = []
-    pendingToolTimestamp = undefined
+    if (!appendPartsToActiveAssistant(pendingToolParts, pendingToolTimestamp)) {
+      result.push({
+        id: `${pendingToolTimestamp || Date.now()}-${index}-tools`,
+        role: 'assistant',
+        parts: pendingToolParts,
+        timestamp: pendingToolTimestamp
+      })
+      activeAssistantIndex = result.length - 1
+    }
+
+    clearPendingTools()
   }
 
   messages.forEach((message, index) => {
@@ -515,6 +562,11 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     }
 
     if (!parts.length) {
+      if (message.role !== 'assistant') {
+        flushPendingTools(index)
+        activeAssistantIndex = null
+      }
+
       return
     }
 
@@ -528,22 +580,30 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       return
     }
 
-    if (message.role === 'assistant' && pendingToolParts.length) {
-      const last = result.at(-1)
+    if (message.role === 'assistant') {
+      if (pendingToolParts.length) {
+        if (!appendPartsToActiveAssistant(pendingToolParts, message.timestamp ?? pendingToolTimestamp)) {
+          parts.unshift(...pendingToolParts)
+        }
 
-      if (last?.role === 'assistant') {
-        last.parts = [...last.parts, ...pendingToolParts, ...parts]
-        last.timestamp = message.timestamp ?? last.timestamp
-        pendingToolParts = []
-        pendingToolTimestamp = undefined
+        clearPendingTools()
+      }
+
+      const activeAssistant =
+        activeAssistantIndex !== null && result[activeAssistantIndex]?.role === 'assistant'
+          ? result[activeAssistantIndex]
+          : null
+
+      const currentHasToolCall = parts.some(part => part.type === 'tool-call')
+      const activeHasToolCall = Boolean(activeAssistant?.parts.some(part => part.type === 'tool-call'))
+
+      if (activeAssistant && (currentHasToolCall || activeHasToolCall)) {
+        activeAssistant.parts = [...activeAssistant.parts, ...parts]
+        activeAssistant.timestamp = message.timestamp ?? activeAssistant.timestamp
 
         return
       }
-
-      parts.unshift(...pendingToolParts)
-      pendingToolParts = []
-      pendingToolTimestamp = undefined
-    } else if (message.role !== 'assistant') {
+    } else {
       flushPendingTools(index)
     }
 
@@ -553,6 +613,8 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       parts,
       timestamp: message.timestamp
     })
+
+    activeAssistantIndex = message.role === 'assistant' ? result.length - 1 : null
   })
   flushPendingTools(messages.length)
 

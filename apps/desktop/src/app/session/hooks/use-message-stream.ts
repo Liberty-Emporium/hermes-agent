@@ -62,6 +62,15 @@ interface QueuedStreamDeltas {
 
 const STREAM_DELTA_FLUSH_MS = 16
 
+// Anonymous progress events that carry todos but no name still belong to the
+// todo stream; named todo events are obviously routed there too.
+function toTodoPayload(payload: GatewayEventPayload | undefined): GatewayEventPayload | undefined {
+  if (!payload) {return undefined}
+  const isTodo = payload.name === 'todo' || (!payload.name && Object.hasOwn(payload, 'todos'))
+
+  return isTodo ? { ...payload, name: 'todo', tool_id: payload.tool_id || 'todo-live' } : undefined
+}
+
 export function useMessageStream({
   activeSessionIdRef,
   hydrateFromStoredSession,
@@ -552,17 +561,13 @@ export function useMessageStream({
           setCurrentUsage(current => ({ ...current, ...payload.usage }))
         }
       } else if (event.type === 'tool.start' || event.type === 'tool.progress' || event.type === 'tool.generating') {
-        if (!sessionId) {
-          return
-        }
-
+        if (!sessionId) {return}
         flushQueuedDeltas(sessionId)
-
-        upsertToolCall(sessionId, payload, 'running')
+        upsertToolCall(sessionId, toTodoPayload(payload) ?? payload, 'running')
       } else if (event.type === 'tool.complete') {
         if (sessionId) {
           flushQueuedDeltas(sessionId)
-          upsertToolCall(sessionId, payload, 'complete')
+          upsertToolCall(sessionId, toTodoPayload(payload) ?? payload, 'complete')
         }
 
         if (typeof payload?.inline_diff === 'string' && payload.inline_diff.trim()) {

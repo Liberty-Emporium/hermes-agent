@@ -9,9 +9,9 @@ import {
 import { code } from '@streamdown/code'
 import { type ComponentProps, memo, useEffect, useMemo, useState } from 'react'
 
-import { PreviewAttachment } from '@/components/assistant-ui/preview-attachment'
-import { SyntaxHighlighter } from '@/components/assistant-ui/shiki-highlighter'
-import { ZoomableImage } from '@/components/assistant-ui/zoomable-image'
+import { PreviewAttachment } from '@/components/chat/preview-attachment'
+import { SyntaxHighlighter } from '@/components/chat/shiki-highlighter'
+import { ZoomableImage } from '@/components/chat/zoomable-image'
 import { CopyButton } from '@/components/ui/copy-button'
 import { normalizeExternalUrl, openExternalLink, PrettyLink } from '@/lib/external-link'
 import { isLikelyProseCodeBlock, sanitizeLanguageTag } from '@/lib/markdown-code'

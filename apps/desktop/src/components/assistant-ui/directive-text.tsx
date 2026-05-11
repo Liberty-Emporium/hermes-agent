@@ -5,7 +5,7 @@ import type { TextMessagePartComponent, TextMessagePartProps } from '@assistant-
 import type { FC } from 'react'
 import { Fragment, useEffect, useMemo, useState } from 'react'
 
-import { ZoomableImage } from '@/components/assistant-ui/zoomable-image'
+import { ZoomableImage } from '@/components/chat/zoomable-image'
 import { extractEmbeddedImages } from '@/lib/embedded-images'
 
 const HERMES_REF_TYPES = ['file', 'folder', 'url', 'image', 'tool', 'line'] as const
@@ -42,8 +42,6 @@ const ICON_PATHS: Record<HermesRefType, string[]> = {
 
 const ICON_FALLBACK = ['M8 12a4 4 0 1 0 8 0a4 4 0 1 0 -8 0', 'M16 12v1.5a2.5 2.5 0 0 0 5 0v-1.5a9 9 0 1 0 -5.5 8.28']
 
-const ICON_CLASS = 'size-3 shrink-0 opacity-80'
-
 const SVG_ATTRS =
   'xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"'
 
@@ -55,12 +53,12 @@ export function directiveIconSvg(type: string) {
     .map(d => `<path d="${d}"/>`)
     .join('')
 
-  return `<svg ${SVG_ATTRS} class="${ICON_CLASS}">${inner}</svg>`
+  return `<svg ${SVG_ATTRS} class="size-3 shrink-0 opacity-80">${inner}</svg>`
 }
 
 export function directiveIconElement(type: string) {
   const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
-  svg.setAttribute('class', ICON_CLASS)
+  svg.setAttribute('class', 'size-3 shrink-0 opacity-80')
   svg.setAttribute('fill', 'none')
   svg.setAttribute('stroke', 'currentColor')
   svg.setAttribute('stroke-linecap', 'round')
@@ -80,7 +78,7 @@ export function directiveIconElement(type: string) {
 
 const DirectiveIcon: FC<{ type: string }> = ({ type }) => (
   <svg
-    className={ICON_CLASS}
+    className="size-3 shrink-0 opacity-80"
     fill="none"
     stroke="currentColor"
     strokeLinecap="round"

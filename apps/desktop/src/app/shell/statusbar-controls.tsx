@@ -43,9 +43,6 @@ interface StatusbarControlsProps extends ComponentProps<'footer'> {
   items?: readonly StatusbarItem[]
 }
 
-const statusbarItemClass =
-  'inline-flex h-full cursor-pointer items-center gap-1 rounded-none px-1.5 text-[0.68rem] text-muted-foreground/95 transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground disabled:cursor-default disabled:opacity-45'
-
 export function StatusbarControls({ className, leftItems = [], items = [], ...props }: StatusbarControlsProps) {
   const navigate = useNavigate()
 
@@ -91,7 +88,10 @@ function StatusbarItemView({ item, navigate }: { item: StatusbarItem; navigate: 
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <button
-            className={cn(statusbarItemClass, item.className)}
+            className={cn(
+              'inline-flex h-full cursor-pointer items-center gap-1 rounded-none px-1.5 text-[0.68rem] text-muted-foreground/95 transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground disabled:cursor-default disabled:opacity-45',
+              item.className
+            )}
             disabled={item.disabled}
             title={title}
             type="button"
@@ -162,7 +162,10 @@ function StatusbarItemView({ item, navigate }: { item: StatusbarItem; navigate: 
   if (item.href || item.variant === 'link') {
     return (
       <a
-        className={cn(statusbarItemClass, item.className)}
+        className={cn(
+          'inline-flex h-full cursor-pointer items-center gap-1 rounded-none px-1.5 text-[0.68rem] text-muted-foreground/95 transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground disabled:cursor-default disabled:opacity-45',
+          item.className
+        )}
         href={item.href}
         rel="noreferrer"
         target="_blank"
@@ -175,7 +178,10 @@ function StatusbarItemView({ item, navigate }: { item: StatusbarItem; navigate: 
 
   return (
     <button
-      className={cn(statusbarItemClass, item.className)}
+      className={cn(
+        'inline-flex h-full cursor-pointer items-center gap-1 rounded-none px-1.5 text-[0.68rem] text-muted-foreground/95 transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground disabled:cursor-default disabled:opacity-45',
+        item.className
+      )}
       disabled={item.disabled}
       onClick={() => {
         if (item.to) {

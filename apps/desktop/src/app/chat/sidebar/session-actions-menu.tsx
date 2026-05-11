@@ -50,7 +50,6 @@ export function SessionActionsMenu({
   align = 'end',
   sideOffset = 6
 }: SessionActionsMenuProps) {
-  const itemClass = 'gap-2.5 text-foreground focus:bg-accent [&_svg]:size-4'
   const [renameOpen, setRenameOpen] = useState(false)
 
   return (
@@ -59,7 +58,7 @@ export function SessionActionsMenu({
         <DropdownMenuTrigger asChild>{children}</DropdownMenuTrigger>
         <DropdownMenuContent align={align} aria-label={`Actions for ${title}`} className="w-44" sideOffset={sideOffset}>
           <DropdownMenuItem
-            className={itemClass}
+            className="gap-2.5 text-foreground focus:bg-accent [&_svg]:size-4"
             disabled={!onPin}
             onSelect={() => {
               triggerHaptic('selection')
@@ -71,14 +70,14 @@ export function SessionActionsMenu({
           </DropdownMenuItem>
           <CopyButton
             appearance="menu-item"
-            className={itemClass}
+            className="gap-2.5 text-foreground focus:bg-accent [&_svg]:size-4"
             disabled={!sessionId}
             errorMessage="Could not copy session ID"
             label="Copy ID"
             text={sessionId}
           />
           <DropdownMenuItem
-            className={itemClass}
+            className="gap-2.5 text-foreground focus:bg-accent [&_svg]:size-4"
             disabled={!sessionId}
             onSelect={() => {
               triggerHaptic('selection')
@@ -89,7 +88,7 @@ export function SessionActionsMenu({
             <span>Export</span>
           </DropdownMenuItem>
           <DropdownMenuItem
-            className={itemClass}
+            className="gap-2.5 text-foreground focus:bg-accent [&_svg]:size-4"
             disabled={!sessionId}
             onSelect={() => {
               triggerHaptic('selection')
@@ -101,7 +100,10 @@ export function SessionActionsMenu({
           </DropdownMenuItem>
           <DropdownMenuSeparator className="my-3" />
           <DropdownMenuItem
-            className={cn(itemClass, 'text-destructive focus:text-destructive')}
+            className={cn(
+              'gap-2.5 text-foreground focus:bg-accent [&_svg]:size-4',
+              'text-destructive focus:text-destructive'
+            )}
             disabled={!onDelete}
             onSelect={() => {
               triggerHaptic('warning')

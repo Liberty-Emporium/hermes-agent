@@ -14,8 +14,6 @@ import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, Command
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from './ui/dialog'
 import { Skeleton } from './ui/skeleton'
 
-const pickerPanelClass = 'max-h-[85vh] max-w-2xl gap-0 overflow-hidden p-0'
-
 interface ModelPickerDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -73,7 +71,7 @@ export function ModelPickerDialog({
 
   return (
     <Dialog onOpenChange={onOpenChange} open={open}>
-      <DialogContent className={pickerPanelClass}>
+      <DialogContent className="max-h-[85vh] max-w-2xl gap-0 overflow-hidden p-0">
         <DialogHeader className="border-b border-border px-4 py-3">
           <DialogTitle>Switch model</DialogTitle>
           <DialogDescription className="font-mono text-xs leading-relaxed">

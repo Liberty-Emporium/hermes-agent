@@ -50,9 +50,6 @@ import type { ChatBarProps } from './types'
 import { UrlDialog } from './url-dialog'
 import { VoiceActivity, VoicePlaybackActivity } from './voice-activity'
 
-const COMPOSER_SHELL_CLASS =
-  'group/composer absolute bottom-0 left-1/2 z-30 w-[min(var(--composer-width),calc(100%-2rem))] max-w-full -translate-x-1/2 rounded-2xl pt-2 pb-[var(--composer-shell-pad-block-end)]'
-
 function extractClipboardImageBlobs(clipboard: DataTransfer): Blob[] {
   const blobs: Blob[] = []
   const seen = new Set<Blob>()
@@ -110,21 +107,6 @@ function extractClipboardImageBlobs(clipboard: DataTransfer): Blob[] {
 }
 
 const COMPOSER_STACK_BREAKPOINT_PX = 320
-
-const COMPOSER_SCROLLED_DIM_CLASS =
-  'opacity-30 group-hover/composer:opacity-100 group-focus-within/composer:opacity-100'
-
-const COMPOSER_FROST_CLASS = cn(
-  'pointer-events-none absolute inset-0 -z-10 rounded-[inherit]',
-  'bg-[color-mix(in_srgb,var(--dt-card)_72%,transparent)]',
-  'backdrop-blur-[0.75rem] backdrop-saturate-[1.12]',
-  '[-webkit-backdrop-filter:blur(0.75rem)_saturate(1.12)]',
-  'transition-[background-color] duration-150 ease-out',
-  'group-data-[thread-scrolled-up]/composer:bg-[color-mix(in_srgb,var(--dt-card)_48%,transparent)]',
-  'group-focus-within/composer:bg-[var(--dt-card)]',
-  'group-focus-within/composer:[backdrop-filter:none]',
-  'group-focus-within/composer:[-webkit-backdrop-filter:none]'
-)
 
 const COMPOSER_GLASS = {
   fadeBackground: 'linear-gradient(to bottom, transparent, color-mix(in srgb, var(--dt-background) 10%, transparent))',
@@ -921,7 +903,7 @@ export function ChatBar({
     <>
       <ComposerPrimitive.Unstable_TriggerPopoverRoot>
         <ComposerPrimitive.Root
-          className={COMPOSER_SHELL_CLASS}
+          className="group/composer absolute bottom-0 left-1/2 z-30 w-[min(var(--composer-width),calc(100%-2rem))] max-w-full -translate-x-1/2 rounded-2xl pt-2 pb-[var(--composer-shell-pad-block-end)]"
           data-drag-active={dragActive ? '' : undefined}
           data-slot="composer-root"
           data-thread-scrolled-up={scrolledUp ? '' : undefined}
@@ -955,7 +937,9 @@ export function ChatBar({
             <div
               className={cn(
                 'composer-liquid-shell-wrap absolute -inset-px isolate overflow-hidden rounded-[calc(var(--radius-2xl)+1px)] transition-opacity duration-200 ease-out',
-                scrolledUp ? COMPOSER_SCROLLED_DIM_CLASS : 'opacity-100'
+                scrolledUp
+                  ? 'opacity-30 group-hover/composer:opacity-100 group-focus-within/composer:opacity-100'
+                  : 'opacity-100'
               )}
               data-glass-frame="true"
               data-show-library-rims={COMPOSER_GLASS.showLibraryRims ? 'true' : undefined}
@@ -990,7 +974,20 @@ export function ChatBar({
               data-slot="composer-surface"
               ref={composerSurfaceRef}
             >
-              <div aria-hidden className={COMPOSER_FROST_CLASS} />
+              <div
+                aria-hidden
+                className={cn(
+                  'pointer-events-none absolute inset-0 -z-10 rounded-[inherit]',
+                  'bg-[color-mix(in_srgb,var(--dt-card)_72%,transparent)]',
+                  'backdrop-blur-[0.75rem] backdrop-saturate-[1.12]',
+                  '[-webkit-backdrop-filter:blur(0.75rem)_saturate(1.12)]',
+                  'transition-[background-color] duration-150 ease-out',
+                  'group-data-[thread-scrolled-up]/composer:bg-[color-mix(in_srgb,var(--dt-card)_48%,transparent)]',
+                  'group-focus-within/composer:bg-[var(--dt-card)]',
+                  'group-focus-within/composer:[backdrop-filter:none]',
+                  'group-focus-within/composer:[-webkit-backdrop-filter:none]'
+                )}
+              />
               {dragActive && (
                 <div
                   aria-hidden
@@ -1002,7 +999,9 @@ export function ChatBar({
               <div
                 className={cn(
                   'relative z-1 flex min-h-0 w-full flex-col gap-(--composer-row-gap) overflow-hidden rounded-[inherit] px-(--composer-surface-pad-x) py-(--composer-surface-pad-y) transition-opacity duration-200 ease-out',
-                  scrolledUp ? COMPOSER_SCROLLED_DIM_CLASS : 'opacity-100'
+                  scrolledUp
+                    ? 'opacity-30 group-hover/composer:opacity-100 group-focus-within/composer:opacity-100'
+                    : 'opacity-100'
                 )}
                 data-slot="composer-fade"
               >
@@ -1042,11 +1041,27 @@ export function ChatBar({
 export function ChatBarFallback() {
   return (
     <div
-      className={cn(COMPOSER_SHELL_CLASS, 'bg-linear-to-b from-transparent to-background/55')}
+      className={cn(
+        'group/composer absolute bottom-0 left-1/2 z-30 w-[min(var(--composer-width),calc(100%-2rem))] max-w-full -translate-x-1/2 rounded-2xl pt-2 pb-[var(--composer-shell-pad-block-end)]',
+        'bg-linear-to-b from-transparent to-background/55'
+      )}
       data-slot="composer-root"
     >
       <div className="composer-fallback-surface relative isolate h-(--composer-fallback-height) w-full rounded-[inherit] border border-[color-mix(in_srgb,var(--dt-composer-ring)_calc(18%*var(--composer-ring-strength)),var(--dt-input))] shadow-composer">
-        <div aria-hidden className={COMPOSER_FROST_CLASS} />
+        <div
+          aria-hidden
+          className={cn(
+            'pointer-events-none absolute inset-0 -z-10 rounded-[inherit]',
+            'bg-[color-mix(in_srgb,var(--dt-card)_72%,transparent)]',
+            'backdrop-blur-[0.75rem] backdrop-saturate-[1.12]',
+            '[-webkit-backdrop-filter:blur(0.75rem)_saturate(1.12)]',
+            'transition-[background-color] duration-150 ease-out',
+            'group-data-[thread-scrolled-up]/composer:bg-[color-mix(in_srgb,var(--dt-card)_48%,transparent)]',
+            'group-focus-within/composer:bg-[var(--dt-card)]',
+            'group-focus-within/composer:[backdrop-filter:none]',
+            'group-focus-within/composer:[-webkit-backdrop-filter:none]'
+          )}
+        />
       </div>
     </div>
   )

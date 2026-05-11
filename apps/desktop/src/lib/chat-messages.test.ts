@@ -26,6 +26,46 @@ describe('toChatMessages', () => {
     expect(chatMessageText(messages[0])).toBe('Planning.Done.')
   })
 
+  it('keeps assistant tool-call iterations in one loaded assistant bubble', () => {
+    const messages = toChatMessages([
+      { role: 'user', content: 'check this repo', timestamp: 1 },
+      {
+        role: 'assistant',
+        content: "Let me also check if there's a top-level lint workflow.",
+        timestamp: 2,
+        tool_calls: [{ id: 'tc-1', function: { name: 'search_files', arguments: '{"path":".github"}' } }]
+      },
+      {
+        role: 'tool',
+        tool_call_id: 'tc-1',
+        tool_name: 'search_files',
+        content: '{"error":"Path not found: /repo/.github"}',
+        timestamp: 3
+      },
+      {
+        role: 'assistant',
+        content: 'No CI in this repo. Build is enough.',
+        timestamp: 4,
+        tool_calls: [{ id: 'tc-2', function: { name: 'terminal', arguments: '{"command":"git status --short"}' } }]
+      },
+      {
+        role: 'tool',
+        tool_call_id: 'tc-2',
+        tool_name: 'terminal',
+        content: '{"output":"M src/ui/components/image-distortion.tsx\\n","exit_code":0}',
+        timestamp: 5
+      },
+      { role: 'assistant', content: 'Now let me check git status and commit.', timestamp: 6 }
+    ])
+
+    const assistantMessages = messages.filter(message => message.role === 'assistant')
+
+    expect(assistantMessages).toHaveLength(1)
+    expect(assistantMessages[0].parts.filter(part => part.type === 'tool-call')).toHaveLength(2)
+    expect(chatMessageText(assistantMessages[0])).toContain("Let me also check if there's a top-level lint workflow.")
+    expect(chatMessageText(assistantMessages[0])).toContain('Now let me check git status and commit.')
+  })
+
   it('hides attached context payloads from user message display', () => {
     const [message] = toChatMessages([
       {
@@ -119,5 +159,69 @@ describe('upsertToolPart', () => {
     expect(part && 'result' in part ? part.result : undefined).toMatchObject({
       inline_diff: '--- a/foo.ts\n+++ b/foo.ts\n@@\n-old\n+new'
     })
+  })
+
+  it('keeps live todo rows stable across sparse progress payloads', () => {
+    const first = upsertToolPart(
+      [],
+      {
+        name: 'todo',
+        todos: [{ content: 'Boil water', id: 'boil', status: 'in_progress' }],
+        tool_id: 'todo-1'
+      },
+      'running'
+    )
+
+    const progressed = upsertToolPart(
+      first,
+      {
+        name: 'todo',
+        preview: 'updating plan',
+        tool_id: 'todo-1'
+      },
+      'running'
+    )
+
+    const [part] = progressed
+    const args = part && 'args' in part ? (part.args as Record<string, unknown>) : {}
+
+    expect(args.todos).toEqual([{ content: 'Boil water', id: 'boil', status: 'in_progress' }])
+  })
+
+  it('archives todo state on completion and accepts explicit empty clears', () => {
+    const started = upsertToolPart(
+      [],
+      {
+        name: 'todo',
+        todos: [{ content: 'Boil water', id: 'boil', status: 'in_progress' }],
+        tool_id: 'todo-1'
+      },
+      'running'
+    )
+
+    const completed = upsertToolPart(
+      started,
+      {
+        name: 'todo',
+        tool_id: 'todo-1'
+      },
+      'complete'
+    )
+
+    const cleared = upsertToolPart(
+      completed,
+      {
+        name: 'todo',
+        todos: [],
+        tool_id: 'todo-1'
+      },
+      'complete'
+    )
+
+    const completedResult = completed[0] && 'result' in completed[0] ? (completed[0].result as Record<string, unknown>) : {}
+    const clearedResult = cleared[0] && 'result' in cleared[0] ? (cleared[0].result as Record<string, unknown>) : {}
+
+    expect(completedResult.todos).toEqual([{ content: 'Boil water', id: 'boil', status: 'in_progress' }])
+    expect(clearedResult.todos).toEqual([])
   })
 })

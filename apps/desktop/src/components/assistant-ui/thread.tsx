@@ -14,18 +14,19 @@ import { useStore } from '@nanostores/react'
 import { type FC, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { StickToBottom, useStickToBottomContext } from 'use-stick-to-bottom'
 
-import { useElapsedSeconds } from '@/components/assistant-ui/activity-timer'
-import { ActivityTimerText } from '@/components/assistant-ui/activity-timer-text'
 import { ClarifyTool } from '@/components/assistant-ui/clarify-tool'
 import { DirectiveContent, DirectiveText } from '@/components/assistant-ui/directive-text'
-import { DisclosureRow } from '@/components/assistant-ui/disclosure-row'
-import { GeneratedImageProvider, useGeneratedImageContext } from '@/components/assistant-ui/generated-image-context'
-import { ImageGenerationPlaceholder } from '@/components/assistant-ui/image-generation-placeholder'
-import { Intro, type IntroProps } from '@/components/assistant-ui/intro'
 import { MarkdownText } from '@/components/assistant-ui/markdown-text'
-import { PreviewAttachment } from '@/components/assistant-ui/preview-attachment'
+import { HoistedTodoPanel, todosFromMessageContent } from '@/components/assistant-ui/todo-tool'
 import { ToolFallback } from '@/components/assistant-ui/tool-fallback'
 import { TooltipIconButton } from '@/components/assistant-ui/tooltip-icon-button'
+import { useElapsedSeconds } from '@/components/chat/activity-timer'
+import { ActivityTimerText } from '@/components/chat/activity-timer-text'
+import { DisclosureRow } from '@/components/chat/disclosure-row'
+import { GeneratedImageProvider, useGeneratedImageContext } from '@/components/chat/generated-image-context'
+import { ImageGenerationPlaceholder } from '@/components/chat/image-generation-placeholder'
+import { Intro, type IntroProps } from '@/components/chat/intro'
+import { PreviewAttachment } from '@/components/chat/preview-attachment'
 import { CopyButton } from '@/components/ui/copy-button'
 import {
   DropdownMenu,
@@ -354,6 +355,7 @@ const AssistantMessage: FC<{ onBranchInNewChat?: (messageId: string) => void }> 
   const messageId = useAuiState(s => s.message.id)
   const content = useAuiState(s => s.message.content)
   const messageText = messageContentText(content)
+  const hoistedTodos = useMemo(() => todosFromMessageContent(content), [content])
 
   const previewTargets = useMemo(() => {
     if (!messageText || !/(https?:\/\/|file:\/\/)/i.test(messageText)) {
@@ -379,6 +381,7 @@ const AssistantMessage: FC<{ onBranchInNewChat?: (messageId: string) => void }> 
         className="wrap-anywhere min-w-0 max-w-full overflow-hidden text-pretty text-base leading-(--dt-line-height) text-foreground"
         data-slot="aui_assistant-message-content"
       >
+        {hoistedTodos.length > 0 && <HoistedTodoPanel todos={hoistedTodos} />}
         <MessagePrimitive.Parts
           components={{
             Text: MarkdownText,
@@ -458,13 +461,12 @@ const ImageGenerateTool: FC<ToolCallMessagePartProps> = ({ result }) => {
 }
 
 const ChainToolFallback: FC<ToolCallMessagePartProps> = props => {
-  if (props.toolName === 'image_generate') {
-    return <ImageGenerateTool {...props} />
-  }
+  // todo parts are hoisted to a dedicated panel above the message content.
+  if (props.toolName === 'todo') {return null}
 
-  if (props.toolName === 'clarify') {
-    return <ClarifyTool {...props} />
-  }
+  if (props.toolName === 'image_generate') {return <ImageGenerateTool {...props} />}
+
+  if (props.toolName === 'clarify') {return <ClarifyTool {...props} />}
 
   return <ToolFallback {...props} />
 }
@@ -472,9 +474,10 @@ const ChainToolFallback: FC<ToolCallMessagePartProps> = props => {
 const ThinkingDisclosure: FC<{
   children: ReactNode
   pending?: boolean
-}> = ({ children, pending = false }) => {
+  timerKey?: string
+}> = ({ children, pending = false, timerKey }) => {
   const [open, setOpen] = useState(false)
-  const elapsed = useElapsedSeconds(pending)
+  const elapsed = useElapsedSeconds(pending, timerKey)
 
   return (
     <div className="text-sm text-muted-foreground" data-slot="aui_thinking-disclosure">
@@ -503,9 +506,10 @@ const ThinkingDisclosure: FC<{
 }
 
 const ReasoningAccordionGroup: FC<{ children?: ReactNode; endIndex: number; startIndex: number }> = ({ children }) => {
-  const pending = useAuiState(s => s.message.status?.type === 'running')
+  const pending = useAuiState(s => s.thread.isRunning && s.message.status?.type === 'running')
+  const messageId = useAuiState(s => s.message.id)
 
-  return <ThinkingDisclosure pending={pending}>{children}</ThinkingDisclosure>
+  return <ThinkingDisclosure pending={pending} timerKey={`reasoning:${messageId}`}>{children}</ThinkingDisclosure>
 }
 
 const ReasoningTextPart: FC<{ text: string; status?: { type: string } }> = ({ text, status }) => {
@@ -654,22 +658,19 @@ const AssistantFooter: FC<MessageActionProps> = props => (
       className="inline-flex h-6 items-center gap-1 text-xs text-muted-foreground"
       hideWhenSingleBranch
     >
-      <BranchPickerPrimitive.Previous className={branchButtonClass}>
+      <BranchPickerPrimitive.Previous className="grid size-6 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-35">
         <ChevronLeftIcon className="size-3.5" />
       </BranchPickerPrimitive.Previous>
       <span className="tabular-nums">
         <BranchPickerPrimitive.Number /> / <BranchPickerPrimitive.Count />
       </span>
-      <BranchPickerPrimitive.Next className={branchButtonClass}>
+      <BranchPickerPrimitive.Next className="grid size-6 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-35">
         <ChevronRightIcon className="size-3.5" />
       </BranchPickerPrimitive.Next>
     </BranchPickerPrimitive.Root>
     <AssistantActionBar {...props} />
   </div>
 )
-
-const branchButtonClass =
-  'grid size-6 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-35'
 
 const EMPTY_ATTACHMENT_REFS: string[] = []
 

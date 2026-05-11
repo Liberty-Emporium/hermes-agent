@@ -4,12 +4,12 @@ import { type ToolCallMessagePartProps, useAuiState } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
 import { type ReactNode, useEffect, useMemo, useRef } from 'react'
 
-import { useElapsedSeconds } from '@/components/assistant-ui/activity-timer'
-import { ActivityTimerText } from '@/components/assistant-ui/activity-timer-text'
-import { CompactMarkdown } from '@/components/assistant-ui/compact-markdown'
-import { DisclosureRow } from '@/components/assistant-ui/disclosure-row'
-import { PreviewAttachment } from '@/components/assistant-ui/preview-attachment'
-import { ZoomableImage } from '@/components/assistant-ui/zoomable-image'
+import { useElapsedSeconds } from '@/components/chat/activity-timer'
+import { ActivityTimerText } from '@/components/chat/activity-timer-text'
+import { CompactMarkdown } from '@/components/chat/compact-markdown'
+import { DisclosureRow } from '@/components/chat/disclosure-row'
+import { PreviewAttachment } from '@/components/chat/preview-attachment'
+import { ZoomableImage } from '@/components/chat/zoomable-image'
 import { CopyButton } from '@/components/ui/copy-button'
 import { FadeText } from '@/components/ui/fade-text'
 import { normalizeExternalUrl, PrettyLink, LinkifiedText as SharedLinkifiedText, urlSlugTitleLabel } from '@/lib/external-link'
@@ -26,11 +26,10 @@ import {
   Wrench
 } from '@/lib/icons'
 import type { LucideIcon } from '@/lib/icons'
+import { extractToolErrorMessage, formatToolResultSummary } from '@/lib/tool-result-summary'
 import { cn } from '@/lib/utils'
 import { $toolInlineDiffs } from '@/store/tool-diffs'
 import { $toolDisclosureStates, $toolViewMode, setToolDisclosureOpen } from '@/store/tool-view'
-
-const TOOL_DETAIL_INDENT_CLASS = 'w-full pl-(--message-text-indent) pr-2'
 
 type ToolTone = 'agent' | 'browser' | 'default' | 'file' | 'image' | 'terminal' | 'web'
 type ToolStatus = 'error' | 'running' | 'success' | 'warning'
@@ -386,52 +385,6 @@ function firstStringField(record: Record<string, unknown>, keys: readonly string
   return ''
 }
 
-function formatScalar(value: unknown): string {
-  if (typeof value === 'string') {
-    return value.trim()
-  }
-
-  if (typeof value === 'number' || typeof value === 'boolean') {
-    return String(value)
-  }
-
-  return ''
-}
-
-function summarizeRecord(record: Record<string, unknown>): string {
-  const title = firstStringField(record, ['title', 'name', 'path', 'file', 'filepath', 'url', 'href', 'link'])
-  const subtitle = firstStringField(record, ['url', 'href', 'link', 'status', 'category'])
-  const body = firstStringField(record, ['snippet', 'description', 'summary', 'message', 'preview', 'text', 'content'])
-
-  if (title || subtitle || body) {
-    return cleanVisibleText([title, subtitle !== title ? subtitle : '', body].filter(Boolean).join('\n'))
-  }
-
-  return Object.entries(record)
-    .map(([key, value]) => {
-      const scalar = formatScalar(value)
-
-      return scalar ? `${titleForTool(key)}: ${compactPreview(cleanVisibleText(scalar), 96)}` : ''
-    })
-    .filter(Boolean)
-    .slice(0, 4)
-    .join('\n')
-}
-
-function summarizeList(items: unknown[], max = 5): string {
-  return items
-    .map(item => {
-      if (isRecord(item) || (typeof item === 'string' && item.trim().startsWith('{'))) {
-        return summarizeRecord(parseMaybeObject(item))
-      }
-
-      return compactPreview(item, 140)
-    })
-    .filter(Boolean)
-    .slice(0, max)
-    .join('\n\n')
-}
-
 function collectResultItems(value: unknown): unknown[] {
   if (Array.isArray(value)) {
     return value
@@ -460,46 +413,6 @@ function collectResultItems(value: unknown): unknown[] {
   return payload === record ? [] : collectResultItems(payload)
 }
 
-function friendlyJsonSummary(value: unknown, depth = 0): string {
-  if (depth > 2) {
-    return ''
-  }
-
-  if (Array.isArray(value)) {
-    return summarizeList(value)
-  }
-
-  const record = parseMaybeObject(value)
-
-  if (!Object.keys(record).length) {
-    return ''
-  }
-
-  const direct = firstStringField(record, ['message', 'summary', 'preview', 'content', 'text', 'stdout', 'stderr', 'error'])
-
-  if (direct) {
-    return cleanVisibleText(direct)
-  }
-
-  const items = collectResultItems(record)
-
-  if (items.length) {
-    return summarizeList(items)
-  }
-
-  const payload = unwrapToolPayload(record)
-
-  if (payload !== value && payload !== record) {
-    const payloadSummary = friendlyJsonSummary(payload, depth + 1)
-
-    if (payloadSummary) {
-      return payloadSummary
-    }
-  }
-
-  return ''
-}
-
 function extractSearchResults(result: unknown, limit = 6): SearchResultRow[] {
   const list = collectResultItems(result)
 
@@ -518,16 +431,26 @@ function extractSearchResults(result: unknown, limit = 6): SearchResultRow[] {
 }
 
 function toolErrorText(part: ToolPart, result: Record<string, unknown>): string {
+  const extractedError = extractToolErrorMessage(part.result)
+
   if (part.isError) {
-    return 'Tool returned an error.'
+    return extractedError || (typeof part.result === 'string' && part.result.trim()) || 'Tool returned an error.'
   }
 
   if (typeof result.error === 'string' && result.error.trim()) {
     return result.error.trim()
   }
 
-  if (result.success === false) {
-    return firstStringField(result, ['message', 'reason']) || 'Tool returned success=false.'
+  if (extractedError) {
+    return extractedError
+  }
+
+  if (result.success === false || result.ok === false) {
+    return firstStringField(result, ['message', 'reason', 'detail']) || 'Tool returned success=false.'
+  }
+
+  if (typeof result.status === 'string' && /\b(error|failed|failure)\b/i.test(result.status)) {
+    return firstStringField(result, ['message', 'reason', 'detail']) || `Tool returned status "${result.status}".`
   }
 
   const exit = numberValue(result.exit_code)
@@ -630,6 +553,32 @@ function inlineDiffFromResult(result: unknown): string {
   return typeof value === 'string' ? stripInlineDiffChrome(value) : ''
 }
 
+function minimalValueSummary(value: unknown): string {
+  if (value == null) {
+    return ''
+  }
+
+  if (typeof value === 'string') {
+    return value
+  }
+
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return String(value)
+  }
+
+  if (Array.isArray(value)) {
+    return value.length ? `Returned ${value.length} items.` : 'No items returned.'
+  }
+
+  if (isRecord(value)) {
+    const count = Object.keys(value).length
+
+    return count ? `Returned object with ${count} fields.` : 'Returned an empty object.'
+  }
+
+  return String(value)
+}
+
 function fallbackDetailText(args: unknown, result: unknown): string {
   const argContext = contextValue(args)
   const resultContext = contextValue(result)
@@ -643,10 +592,10 @@ function fallbackDetailText(args: unknown, result: unknown): string {
   }
 
   if (result !== undefined) {
-    return friendlyJsonSummary(result) || prettyJson(result)
+    return formatToolResultSummary(result) || minimalValueSummary(result)
   }
 
-  return friendlyJsonSummary(args) || prettyJson(args)
+  return formatToolResultSummary(args) || minimalValueSummary(args)
 }
 
 function toolSubtitle(
@@ -743,7 +692,7 @@ function toolSubtitle(
   }
 
   return (
-    compactPreview(friendlyJsonSummary(part.result), 120) ||
+    compactPreview(formatToolResultSummary(part.result), 120) ||
     compactPreview(resultRecord, 120) ||
     compactPreview(argsRecord, 120) ||
     fallbackDetailText(argsRecord, resultRecord)
@@ -1011,15 +960,14 @@ function isToolPart(part: unknown): part is ToolPart {
 }
 
 function groupToolParts(content: unknown): ToolPart[][] {
-  if (!Array.isArray(content)) {
-    return []
-  }
+  if (!Array.isArray(content)) {return []}
 
   const groups: ToolPart[][] = []
   let current: ToolPart[] = []
 
   for (const part of content) {
-    if (isToolPart(part)) {
+    // todo parts render in their own hoisted panel; skip from grouped tools.
+    if (isToolPart(part) && part.toolName !== 'todo') {
       current.push(part)
 
       continue
@@ -1031,9 +979,7 @@ function groupToolParts(content: unknown): ToolPart[][] {
     }
   }
 
-  if (current.length) {
-    groups.push(current)
-  }
+  if (current.length) {groups.push(current)}
 
   return groups
 }
@@ -1134,17 +1080,25 @@ interface ToolEntryProps {
 }
 
 function ToolEntry({ embedded = false, part }: ToolEntryProps) {
-  const isPending = part.result === undefined
-  const elapsed = useElapsedSeconds(isPending)
+  const messageRunning = useAuiState(state => state.thread.isRunning && state.message.status?.type === 'running')
   const toolViewMode = useStore($toolViewMode)
   const disclosureStates = useStore($toolDisclosureStates)
   const disclosureId = toolPartDisclosureId(part)
+  const isPending = messageRunning && part.result === undefined
+  const elapsed = useElapsedSeconds(isPending, `tool:${disclosureId}`)
   const open = disclosureStates[disclosureId] ?? false
   const preview = compactPreview(part.args) || compactPreview(part.result)
   const liveDiffs = useStore($toolInlineDiffs)
   const sideDiff = part.toolCallId ? liveDiffs[part.toolCallId] || '' : ''
   const inlineDiff = stripInlineDiffChrome(sideDiff) || inlineDiffFromResult(part.result)
-  const view = useMemo(() => buildToolView(part, inlineDiff), [inlineDiff, part])
+
+  // Stale parts (no result, but message stopped running) get a synthetic
+  // empty result so buildToolView treats them as completed-no-output.
+  const view = useMemo(() => {
+    const p = !isPending && part.result === undefined ? { ...part, result: {} } : part
+
+    return buildToolView(p, inlineDiff)
+  }, [inlineDiff, isPending, part])
 
   const detailSections = useMemo(() => {
     if (!view.detail) {
@@ -1261,7 +1215,7 @@ function ToolEntry({ embedded = false, part }: ToolEntryProps) {
           ))}
       </DisclosureRow>
       {open && (
-        <div className={cn(TOOL_DETAIL_INDENT_CLASS, 'mt-2 grid min-w-0 max-w-full gap-2 overflow-hidden pb-2')}>
+        <div className={cn('w-full pl-(--message-text-indent) pr-2', 'mt-2 grid min-w-0 max-w-full gap-2 overflow-hidden pb-2')}>
           {!embedded && view.previewTarget && isPreviewableTarget(view.previewTarget) && (
             <PreviewAttachment source="tool-result" target={view.previewTarget} />
           )}
@@ -1359,7 +1313,8 @@ function groupPreviewTargets(parts: ToolPart[]): string[] {
 }
 
 function ToolGroup({ parts }: { parts: ToolPart[] }) {
-  const isRunning = parts.some(part => part.result === undefined)
+  const messageRunning = useAuiState(state => state.thread.isRunning && state.message.status?.type === 'running')
+  const isRunning = messageRunning && parts.some(part => part.result === undefined)
   const disclosureStates = useStore($toolDisclosureStates)
   const disclosureId = toolGroupDisclosureId(parts)
   const open = disclosureStates[disclosureId] ?? isRunning
@@ -1374,6 +1329,7 @@ function ToolGroup({ parts }: { parts: ToolPart[] }) {
   }, [disclosureId, isRunning])
 
   const status = groupStatus(parts)
+  const displayStatus = !isRunning && status === 'running' ? 'warning' : status
 
   const failedStepCount = useMemo(
     () => parts.filter(part => toolStatus(part, parseMaybeObject(part.result)) === 'error').length,
@@ -1395,9 +1351,9 @@ function ToolGroup({ parts }: { parts: ToolPart[] }) {
   }, [parts])
 
   const statusSummary =
-    status === 'running' || failedStepCount === 0
+    displayStatus === 'running' || failedStepCount === 0
       ? ''
-      : status === 'warning'
+      : displayStatus === 'warning'
         ? failedStepCount === 1
           ? 'Recovered after 1 failed step'
           : `Recovered after ${failedStepCount} failed steps`
@@ -1430,7 +1386,7 @@ function ToolGroup({ parts }: { parts: ToolPart[] }) {
       .join('\n\n')
   }, [parts])
 
-  const showGroupStatusGlyph = status !== 'success'
+  const showGroupStatusGlyph = displayStatus !== 'success'
   const previewTargets = useMemo(() => groupPreviewTargets(parts), [parts])
 
   return (
@@ -1446,13 +1402,13 @@ function ToolGroup({ parts }: { parts: ToolPart[] }) {
       >
         <span className="flex min-w-0 items-baseline gap-1.5">
           {showGroupStatusGlyph && (
-            <span className="flex h-[1.1rem] shrink-0 items-center">{statusGlyph(status)}</span>
+            <span className="flex h-[1.1rem] shrink-0 items-center">{statusGlyph(displayStatus)}</span>
           )}
           <FadeText
             className={cn(
               'text-[0.78rem] font-medium leading-[1.1rem] text-foreground/85',
-              status === 'error' && 'text-destructive',
-              status === 'warning' && 'text-amber-700 dark:text-amber-300'
+              displayStatus === 'error' && 'text-destructive',
+              displayStatus === 'warning' && 'text-amber-700 dark:text-amber-300'
             )}
           >
             {groupTitle(parts)}
@@ -1472,7 +1428,7 @@ function ToolGroup({ parts }: { parts: ToolPart[] }) {
           <FadeText
             className={cn(
               'text-[0.68rem] leading-[1.05rem]',
-              status === 'warning' ? 'text-amber-700/80 dark:text-amber-300/85' : 'text-destructive/85'
+              displayStatus === 'warning' ? 'text-amber-700/80 dark:text-amber-300/85' : 'text-destructive/85'
             )}
           >
             {statusSummary}
@@ -1480,14 +1436,14 @@ function ToolGroup({ parts }: { parts: ToolPart[] }) {
         )}
       </DisclosureRow>
       {previewTargets.length > 0 && (
-        <div className={cn(TOOL_DETAIL_INDENT_CLASS, 'mt-2 grid min-w-0 max-w-full gap-2 overflow-hidden')}>
+        <div className={cn('w-full pl-(--message-text-indent) pr-2', 'mt-2 grid min-w-0 max-w-full gap-2 overflow-hidden')}>
           {previewTargets.map(target => (
             <PreviewAttachment key={target} source="tool-result" target={target} />
           ))}
         </div>
       )}
       {open && (
-        <div className={cn(TOOL_DETAIL_INDENT_CLASS, 'mt-0.5 min-w-0 max-w-full overflow-hidden')}>
+        <div className={cn('w-full pl-(--message-text-indent) pr-2', 'mt-0.5 min-w-0 max-w-full overflow-hidden')}>
           {parts.map(part => (
             <ToolEntry embedded key={part.toolCallId || `${part.toolName}-${JSON.stringify(part.args)}`} part={part} />
           ))}

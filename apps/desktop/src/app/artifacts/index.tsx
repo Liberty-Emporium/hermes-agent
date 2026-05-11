@@ -2,7 +2,7 @@ import type * as React from 'react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
-import { ZoomableImage } from '@/components/assistant-ui/zoomable-image'
+import { ZoomableImage } from '@/components/chat/zoomable-image'
 import { PageLoader } from '@/components/page-loader'
 import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
@@ -786,9 +786,6 @@ function ArtifactImageCard({ artifact, failedImage, onImageError, onOpenChat }: 
   )
 }
 
-const CELL_ACTION_CLASS =
-  'flex h-full w-full min-w-0 items-center gap-2 px-2.5 py-1.5 text-left text-sm leading-snug font-medium text-foreground/90 no-underline transition-colors hover:text-foreground hover:underline'
-
 // Single click target for any row cell. External URLs render as <ExternalLink>;
 // local actions render as <button>. Padding lives here, NOT on the <td>, so
 // the entire cell area is hoverable and clickable in both branches.
@@ -805,14 +802,27 @@ function ArtifactCellAction({
 }) {
   if (href) {
     return (
-      <ExternalLink className={CELL_ACTION_CLASS} href={href} showExternalIcon={false} title={title}>
+      <ExternalLink
+        className="flex h-full w-full min-w-0 items-center gap-2 px-2.5 py-1.5 text-left text-sm leading-snug font-medium text-foreground/90 no-underline transition-colors hover:text-foreground hover:underline"
+        href={href}
+        showExternalIcon={false}
+        title={title}
+      >
         {children}
       </ExternalLink>
     )
   }
 
   return (
-    <button className={cn(CELL_ACTION_CLASS, 'cursor-pointer')} onClick={onClick} title={title} type="button">
+    <button
+      className={cn(
+        'flex h-full w-full min-w-0 items-center gap-2 px-2.5 py-1.5 text-left text-sm leading-snug font-medium text-foreground/90 no-underline transition-colors hover:text-foreground hover:underline',
+        'cursor-pointer'
+      )}
+      onClick={onClick}
+      title={title}
+      type="button"
+    >
       {children}
     </button>
   )
