@@ -440,6 +440,46 @@ function findSystemPython() {
   return null
 }
 
+// findGitBash — locate bash.exe on Windows. Hermes' terminal tool requires
+// bash (POSIX shell), and on Windows that's almost always Git for Windows'
+// bundled Git Bash. We check the same set of locations tools/environments/
+// local.py:_find_bash() checks at runtime, so a positive result here means
+// the agent will be able to start a terminal too.
+//
+// On non-Windows hosts bash is part of the OS and this just returns the
+// first bash on PATH.
+function findGitBash() {
+  if (!IS_WINDOWS) {
+    return findOnPath('bash')
+  }
+
+  // install.ps1 drops PortableGit at %LOCALAPPDATA%\hermes\git\... — checked
+  // first so users who installed via install.ps1 are detected before we
+  // start probing system-wide locations.
+  const localAppData = process.env.LOCALAPPDATA || ''
+  const candidates = []
+  if (localAppData) {
+    candidates.push(path.join(localAppData, 'hermes', 'git', 'bin', 'bash.exe'))
+    candidates.push(path.join(localAppData, 'hermes', 'git', 'usr', 'bin', 'bash.exe'))
+  }
+
+  // Standard Git for Windows install locations.
+  candidates.push(path.join(process.env['ProgramFiles'] || 'C:\\Program Files', 'Git', 'bin', 'bash.exe'))
+  candidates.push(path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Git', 'bin', 'bash.exe'))
+  if (localAppData) {
+    candidates.push(path.join(localAppData, 'Programs', 'Git', 'bin', 'bash.exe'))
+  }
+
+  for (const candidate of candidates) {
+    if (fileExists(candidate)) return candidate
+  }
+
+  // Last resort — bash on PATH (covers WSL bash, MSYS2, custom installs).
+  // On WSL hosts findOnPath itself filters out Windows-binary paths via
+  // isWindowsBinaryPathInWsl, so we won't hand back a wsl.exe shim either.
+  return findOnPath('bash')
+}
+
 function getVenvPython(venvRoot) {
   return path.join(venvRoot, IS_WINDOWS ? path.join('Scripts', 'python.exe') : path.join('bin', 'python'))
 }
@@ -951,6 +991,22 @@ async function ensureRuntime(backend) {
     }
     await advanceBootProgress('runtime.venv', 'Creating Hermes virtual environment', 50)
     await runProcess(systemPython, ['-m', 'venv', VENV_ROOT])
+  }
+
+  // Step 2b: On Windows, preflight Git Bash. Hermes' terminal tool calls
+  // bash.exe directly (tools/environments/local.py); without it the agent
+  // can't run a terminal command. We surface this here as a clear, actionable
+  // error rather than letting the user discover it on their first chat
+  // ("hey, run `ls`" → opaque tool failure). The NSIS prereq page handles
+  // this for installer users; this check catches everyone else (.msi users,
+  // npm run dev with a fresh checkout, manual installs, etc.).
+  if (IS_WINDOWS && !findGitBash()) {
+    throw new Error(
+      'Git for Windows is required for Hermes on Windows (provides Git Bash, ' +
+        "which the agent's terminal tool uses). Install it from " +
+        'https://git-scm.com/download/win or run `winget install -e --id Git.Git`, ' +
+        'then relaunch Hermes.'
+    )
   }
 
   // Step 3: Ensure deps are installed. We compare a marker against the

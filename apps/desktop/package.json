@@ -186,7 +186,9 @@
       "allowToChangeInstallationDirectory": true,
       "perMachine": false,
       "shortcutName": "Hermes",
-      "uninstallDisplayName": "Hermes"
+      "uninstallDisplayName": "Hermes",
+      "include": "installer/prereq-check.nsh",
+      "warningsAsErrors": false
     }
   }
 }

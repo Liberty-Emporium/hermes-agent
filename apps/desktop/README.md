@@ -22,6 +22,22 @@ If you're hacking on Hermes from a clone outside `HERMES_HOME/hermes-agent`, poi
 HERMES_DESKTOP_HERMES_ROOT=/path/to/your/clone npm run dev
 ```
 
+### Runtime prerequisites
+
+Hermes Desktop needs:
+
+- **Python 3.11+** — for the agent runtime, dashboard backend, and tool execution.
+- **Git for Windows** (Windows only) — provides Git Bash, which Hermes' terminal tool calls directly. Linux and macOS already ship a system bash.
+
+The packaged Windows installer (`Hermes-*.exe`) detects both at install time. If either is missing it offers to install them via `winget install -e --id Python.Python.3.11` and `winget install -e --id Git.Git`. If `winget` isn't available the installer shows manual download URLs and lets you continue. The MSI installer (`Hermes-*.msi`) doesn't run the prereq page — enterprise deploys are expected to handle prereqs out-of-band.
+
+For dev (`npm run dev`) the same checks happen at first launch via the Electron bootstrapper, which throws a clear error if either prereq is missing. Manual install commands you can run yourself:
+
+```powershell
+winget install -e --id Python.Python.3.11
+winget install -e --id Git.Git
+```
+
 ## Development
 
 ```bash
