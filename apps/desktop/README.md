@@ -26,16 +26,18 @@ HERMES_DESKTOP_HERMES_ROOT=/path/to/your/clone npm run dev
 
 Hermes Desktop needs:
 
-- **Python 3.11+** — for the agent runtime, dashboard backend, and tool execution.
-- **Git for Windows** (Windows only) — provides Git Bash, which Hermes' terminal tool calls directly. Linux and macOS already ship a system bash.
+- **Python 3.11+** — for the agent runtime, dashboard backend, and tool execution. (required)
+- **Git for Windows** (Windows only) — provides Git Bash, which Hermes' terminal tool calls directly. Linux and macOS already ship a system bash. (required)
+- **ripgrep** — used by Hermes' `search_files` tool for fast `.gitignore`-aware file/content search. Recommended on all platforms; Hermes falls back to `grep`/`find` if missing (works but slower and noisier).
 
-The packaged Windows installer (`Hermes-*.exe`) detects both at install time. If either is missing it offers to install them via `winget install -e --id Python.Python.3.11` and `winget install -e --id Git.Git`. If `winget` isn't available the installer shows manual download URLs and lets you continue. The MSI installer (`Hermes-*.msi`) doesn't run the prereq page — enterprise deploys are expected to handle prereqs out-of-band.
+The packaged Windows installer (`Hermes-*.exe`) detects all three at install time. Required items missing are auto-installed via `winget install -e --id Python.Python.3.11 --scope user` and `winget install -e --id Git.Git`. The recommended ripgrep is offered as `winget install -e --id BurntSushi.ripgrep.MSVC --scope user`. If `winget` isn't available the installer shows manual download URLs and lets you continue. The MSI installer (`Hermes-*.msi`) doesn't run the prereq page — enterprise deploys are expected to handle prereqs out-of-band.
 
-For dev (`npm run dev`) the same checks happen at first launch via the Electron bootstrapper, which throws a clear error if either prereq is missing. Manual install commands you can run yourself:
+For dev (`npm run dev`) the Python and Git Bash checks happen at first launch via the Electron bootstrapper, which throws a clear error if either prereq is missing. Manual install commands you can run yourself:
 
 ```powershell
-winget install -e --id Python.Python.3.11
+winget install -e --id Python.Python.3.11 --scope user
 winget install -e --id Git.Git
+winget install -e --id BurntSushi.ripgrep.MSVC --scope user
 ```
 
 ## Development
