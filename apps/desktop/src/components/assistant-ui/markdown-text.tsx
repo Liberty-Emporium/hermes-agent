@@ -7,6 +7,7 @@ import {
   type SyntaxHighlighterProps
 } from '@assistant-ui/react-streamdown'
 import { code } from '@streamdown/code'
+import { createMathPlugin } from '@streamdown/math'
 import { type ComponentProps, memo, useEffect, useMemo, useState } from 'react'
 
 import { PreviewAttachment } from '@/components/chat/preview-attachment'
@@ -26,6 +27,13 @@ import {
 } from '@/lib/media'
 import { previewTargetFromMarkdownHref } from '@/lib/preview-targets'
 import { cn } from '@/lib/utils'
+
+// Math rendering plugin (KaTeX). Configured once at module scope — the
+// plugin is stateless so re-creating per-render is wasted work. Enable
+// `singleDollarTextMath` so models that emit `$x^2$` for inline math
+// (the de-facto convention in OpenAI / Anthropic outputs) render
+// correctly. The default false-setting only accepts `$$...$$` blocks.
+const mathPlugin = createMathPlugin({ singleDollarTextMath: true })
 
 function CodeHeader({ language, code }: { language?: string; code?: string }) {
   const normalizedCode = (code ?? '').replace(/^\n+/, '').trimEnd()
@@ -321,7 +329,7 @@ const MarkdownTextImpl = () => {
       lineNumbers={false}
       mode="streaming"
       parseIncompleteMarkdown={!isStreaming}
-      plugins={isStreaming ? undefined : { code }}
+      plugins={isStreaming ? undefined : { code, math: mathPlugin }}
       preprocess={preprocessMarkdown}
       shikiTheme={['github-light-default', 'github-dark-default']}
     />
