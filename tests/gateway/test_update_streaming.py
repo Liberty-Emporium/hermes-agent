@@ -16,7 +16,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
 
@@ -37,7 +37,11 @@ def _make_runner(hermes_home=None):
     """Create a bare GatewayRunner without calling __init__."""
     from gateway.run import GatewayRunner
     runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig()
     runner.adapters = {}
+    runner.session_store = MagicMock()
+    runner.hooks = MagicMock()
+    runner.hooks.emit_collect = AsyncMock(return_value=[])
     runner._voice_mode = {}
     runner._update_prompt_pending = {}
     runner._running_agents = {}

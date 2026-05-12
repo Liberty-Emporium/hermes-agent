@@ -9373,10 +9373,11 @@ class AIAgent:
         # tool — this caches the entire tools array cross-session via
         # Anthropic's tools→system→messages prefix order. The function
         # returns a deep copy, so self.tools is never mutated.
-        if self._use_long_lived_prefix_cache and self.tools:
+        if getattr(self, "_use_long_lived_prefix_cache", False) and self.tools:
             from agent.prompt_caching import mark_tools_for_long_lived_cache
             tools_for_api = mark_tools_for_long_lived_cache(
-                self.tools, long_lived_ttl=self._long_lived_cache_ttl,
+                self.tools,
+                long_lived_ttl=getattr(self, "_long_lived_cache_ttl", "1h"),
             )
         else:
             tools_for_api = self.tools
