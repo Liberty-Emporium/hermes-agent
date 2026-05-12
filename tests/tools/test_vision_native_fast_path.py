@@ -153,14 +153,13 @@ class TestHandleVisionAnalyzeFastPath:
         img = tmp_path / "x.png"
         img.write_bytes(_TINY_PNG)
 
-        # Set runtime override so the handler thinks we're on opus@openrouter
-        from agent.auxiliary_client import set_runtime_main, clear_runtime_main
-        set_runtime_main("openrouter", "anthropic/claude-opus-4.6")
-        try:
+        # Patch the config readers used by the native fast-path check.
+        with (
+            patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"),
+            patch("agent.auxiliary_client._read_main_model", return_value="anthropic/claude-opus-4.6"),
+        ):
             coro = _handle_vision_analyze({"image_url": str(img), "question": "?"})
             result = asyncio.get_event_loop().run_until_complete(coro)
-        finally:
-            clear_runtime_main()
 
         assert isinstance(result, dict), \
             f"Expected multimodal envelope, got {type(result).__name__}: {str(result)[:200]}"
