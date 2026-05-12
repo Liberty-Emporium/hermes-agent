@@ -15,7 +15,7 @@ in
 pkgs.buildNpmPackage (npm // {
   pname = "hermes-web";
   inherit src npmDeps version;
-  npmRoot = "dashboard";
+  sourceRoot = "apps/dashboard";
 
   doCheck = false;
 
