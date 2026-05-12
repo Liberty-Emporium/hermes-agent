@@ -1618,6 +1618,74 @@ class SessionDB:
             result.append(msg)
         return result
 
+    def get_messages_around(
+        self,
+        session_id: str,
+        around_message_id: int,
+        window: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Load a window of messages anchored on a specific message id.
+
+        Returns up to ``window`` messages before the anchor, the anchor itself,
+        and up to ``window`` messages after — all from the same session,
+        ordered by id ascending. Boundaries are honoured: if the anchor is
+        near the start or end of the session, fewer messages are returned on
+        the truncated side.
+
+        If ``around_message_id`` is not a message id within ``session_id``,
+        returns an empty list. Callers decide whether to surface that as an
+        error.
+
+        Used by ``session_search`` mode='guided' to provide anchored
+        drill-down into a specific session at a specific message — without
+        the cost of summarisation or the risk of 100k-char truncation.
+        """
+        if window < 0:
+            window = 0
+        with self._lock:
+            # Confirm the anchor exists in this session — cheap guard against
+            # cross-session contamination if a caller mixes up session/message
+            # ids.
+            anchor_exists = self._conn.execute(
+                "SELECT 1 FROM messages WHERE id = ? AND session_id = ? LIMIT 1",
+                (around_message_id, session_id),
+            ).fetchone()
+            if not anchor_exists:
+                return []
+
+            # Two queries: anchor + before (DESC, take window+1), and after
+            # (ASC, take window). Final order is id ASC.
+            before_rows = self._conn.execute(
+                "SELECT * FROM messages "
+                "WHERE session_id = ? AND id <= ? "
+                "ORDER BY id DESC LIMIT ?",
+                (session_id, around_message_id, window + 1),
+            ).fetchall()
+            after_rows = self._conn.execute(
+                "SELECT * FROM messages "
+                "WHERE session_id = ? AND id > ? "
+                "ORDER BY id ASC LIMIT ?",
+                (session_id, around_message_id, window),
+            ).fetchall()
+
+        # before_rows is DESC; reverse so it's ASC, then concatenate after_rows.
+        rows = list(reversed(before_rows)) + list(after_rows)
+        result = []
+        for row in rows:
+            msg = dict(row)
+            if "content" in msg:
+                msg["content"] = self._decode_content(msg["content"])
+            if msg.get("tool_calls"):
+                try:
+                    msg["tool_calls"] = json.loads(msg["tool_calls"])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(
+                        "Failed to deserialize tool_calls in get_messages_around, falling back to []"
+                    )
+                    msg["tool_calls"] = []
+            result.append(msg)
+        return result
+
     def resolve_resume_session_id(self, session_id: str) -> str:
         """Redirect a resume target to the descendant session that holds the messages.
 
