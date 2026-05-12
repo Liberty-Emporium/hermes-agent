@@ -325,40 +325,66 @@ def _guided_drill_down(
     around_message_id,
     window: int,
     current_session_id: str = None,
+    anchors: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Anchored drill-down for ``mode='guided'`` of ``session_search``.
 
-    Returns a JSON string carrying a window of messages around a specific
-    message id in a specific session. No FTS5, no auxiliary LLM, no
-    100k-char truncation — one DB query.
+    Returns a JSON string carrying one or more windows of messages — each
+    centred on a specific message id in a specific session. No FTS5, no
+    auxiliary LLM, no 100k-char truncation — N indexed DB lookups (where
+    N = number of anchors).
 
-    Validates: required args, session existence, anchor-in-session,
-    current-lineage exclusion (the active session's history is already
-    in the agent's context so a drill-in there is wasted), and clamps
-    ``window`` to ``[1, 20]``.
+    Two input shapes (use one):
+
+      * **Single anchor** (back-compat): pass ``session_id`` and
+        ``around_message_id`` directly. Internally normalised to a single-
+        element ``anchors`` list. Response always carries ``windows``
+        as a list, plus the legacy single-anchor fields at the top level
+        when there's exactly one anchor.
+
+      * **Multi-anchor**: pass ``anchors=[{"session_id":..., "around_message_id":...}, ...]``.
+        The agent picks the most promising K hits from a wider fast call
+        and drills into all of them at once — same conversation in the
+        steering loop, more context per turn.
+
+    Each anchor is validated independently. Per-anchor failures (missing
+    session, anchor not in session, current-lineage rejection) become
+    error entries inside the response's ``windows`` list rather than
+    aborting the whole call. ``window`` is shared across all anchors
+    and clamped to ``[1, 20]`` (silent, matches the existing limit-clamp
+    pattern).
     """
-    # 1. Required-arg validation. tool_error() preserves consistent shape with
-    #    the rest of session_search; missing args are user-facing failures.
-    if not session_id or not isinstance(session_id, str) or not session_id.strip():
+    # 1. Normalise inputs into a single ``anchors`` list. Three shapes:
+    #    (a) anchors= parameter is set (preferred for multi-anchor)
+    #    (b) session_id + around_message_id (single-anchor back-compat)
+    #    (c) neither set → user-facing error
+    if anchors:
+        if not isinstance(anchors, list):
+            return tool_error(
+                "guided mode: 'anchors' must be a list of {session_id, around_message_id} dicts",
+                success=False,
+            )
+        normalised_anchors = anchors
+    elif session_id or around_message_id is not None:
+        normalised_anchors = [{
+            "session_id": session_id,
+            "around_message_id": around_message_id,
+        }]
+    else:
         return tool_error(
-            "guided mode requires session_id (use match_message_id+session_id "
-            "from a prior fast-mode hit)",
+            "guided mode requires either anchors=[...] or session_id+around_message_id "
+            "(use match_message_id+session_id from a prior fast-mode hit)",
             success=False,
         )
-    session_id = session_id.strip()
 
-    # around_message_id may arrive as int or stringified int (open-source
-    # models love stringifying numerics); coerce defensively.
-    try:
-        around_id = int(around_message_id)
-    except (TypeError, ValueError):
+    if len(normalised_anchors) == 0:
         return tool_error(
-            "guided mode requires around_message_id as an integer "
-            "(use match_message_id from a prior fast-mode hit)",
+            "guided mode: anchors list is empty (pass at least one {session_id, around_message_id})",
             success=False,
         )
 
-    # 2. Window clamp. Matches the existing limit-clamp pattern (silent).
+    # 2. Window clamp (shared across all anchors). Matches the existing
+    #    limit-clamp pattern (silent).
     if not isinstance(window, int):
         try:
             window = int(window)
@@ -366,9 +392,8 @@ def _guided_drill_down(
             window = 5
     window = max(1, min(window, 20))
 
-    # 3. Skip current-lineage drill-down. The agent already has the active
-    #    session's messages in its context — a drill-in there returns
-    #    information it already has.
+    # 3. Helper: resolve to lineage root (used by the current-lineage
+    #    rejection check below).
     def _resolve_to_parent(sid: str) -> str:
         visited = set()
         cur = sid
@@ -388,82 +413,161 @@ def _guided_drill_down(
                 break
         return cur
 
-    if current_session_id:
-        current_root = _resolve_to_parent(current_session_id)
-        target_root = _resolve_to_parent(session_id)
-        if current_root and current_root == target_root:
-            return tool_error(
-                "guided mode rejects drill-down into the current session "
-                "lineage — those messages are already in your active context",
-                success=False,
-            )
+    current_root = _resolve_to_parent(current_session_id) if current_session_id else None
 
-    # 4. Session existence check (separate from the anchor-in-session check
-    #    so we can return a more specific error message).
-    try:
-        session_meta = db.get_session(session_id) or {}
-    except Exception as e:
-        logging.debug("get_session failed for %s: %s", session_id, e, exc_info=True)
-        session_meta = {}
-    if not session_meta:
-        return tool_error(f"session_id not found: {session_id}", success=False)
+    # 4. Drill into each anchor. Per-anchor errors are recorded inline
+    #    rather than aborting the whole call — the agent can still use
+    #    successful drills even if one anchor was malformed.
+    windows_out: List[Dict[str, Any]] = []
+    for raw_anchor in normalised_anchors:
+        if not isinstance(raw_anchor, dict):
+            windows_out.append({
+                "success": False,
+                "error": "anchor must be a dict with session_id + around_message_id",
+            })
+            continue
 
-    # 5. Fetch the window. get_messages_around() returns [] if the anchor
-    #    isn't in this session — translate to a specific error.
-    try:
-        messages = db.get_messages_around(session_id, around_id, window=window)
-    except Exception as e:
-        logging.debug("get_messages_around failed: %s", e, exc_info=True)
-        return tool_error(
-            f"failed to load messages around {around_id} in {session_id}: {e}",
-            success=False,
-        )
-    if not messages:
-        return tool_error(
-            f"around_message_id {around_id} not in session_id {session_id}",
-            success=False,
-        )
+        a_sid = raw_anchor.get("session_id")
+        a_msg = raw_anchor.get("around_message_id")
 
-    # 6. Wrap with anchor flag + boundary counts so the agent can see "this is
-    #    everything available" without a follow-up call.
-    out_messages = []
-    messages_before = 0
-    messages_after = 0
-    for m in messages:
-        is_anchor = m.get("id") == around_id
-        if not is_anchor and m.get("id", 0) < around_id:
-            messages_before += 1
-        elif not is_anchor:
-            messages_after += 1
-        out_messages.append({
-            "id": m.get("id"),
-            "role": m.get("role"),
-            "content": m.get("content"),
-            "tool_name": m.get("tool_name"),
-            "tool_calls": m.get("tool_calls") or None,
-            "tool_call_id": m.get("tool_call_id"),
-            "timestamp": m.get("timestamp"),
-            **({"anchor": True} if is_anchor else {}),
+        if not a_sid or not isinstance(a_sid, str) or not a_sid.strip():
+            windows_out.append({
+                "success": False,
+                "error": "anchor missing session_id",
+                "anchor": raw_anchor,
+            })
+            continue
+        a_sid = a_sid.strip()
+
+        try:
+            a_msg_id = int(a_msg)
+        except (TypeError, ValueError):
+            windows_out.append({
+                "success": False,
+                "error": "anchor missing or non-integer around_message_id",
+                "anchor": raw_anchor,
+            })
+            continue
+
+        # Current-lineage rejection: per-anchor, so other valid anchors
+        # in a multi-anchor call still drill.
+        if current_root:
+            target_root = _resolve_to_parent(a_sid)
+            if target_root and target_root == current_root:
+                windows_out.append({
+                    "success": False,
+                    "error": "anchor rejects drill-down into the current session lineage — those messages are already in your active context",
+                    "session_id": a_sid,
+                    "around_message_id": a_msg_id,
+                })
+                continue
+
+        # Session existence check.
+        try:
+            session_meta = db.get_session(a_sid) or {}
+        except Exception as e:
+            logging.debug("get_session failed for %s: %s", a_sid, e, exc_info=True)
+            session_meta = {}
+        if not session_meta:
+            windows_out.append({
+                "success": False,
+                "error": f"session_id not found: {a_sid}",
+                "session_id": a_sid,
+                "around_message_id": a_msg_id,
+            })
+            continue
+
+        # Fetch the window.
+        try:
+            messages = db.get_messages_around(a_sid, a_msg_id, window=window)
+        except Exception as e:
+            logging.debug("get_messages_around failed: %s", e, exc_info=True)
+            windows_out.append({
+                "success": False,
+                "error": f"failed to load messages around {a_msg_id} in {a_sid}: {e}",
+                "session_id": a_sid,
+                "around_message_id": a_msg_id,
+            })
+            continue
+        if not messages:
+            windows_out.append({
+                "success": False,
+                "error": f"around_message_id {a_msg_id} not in session_id {a_sid}",
+                "session_id": a_sid,
+                "around_message_id": a_msg_id,
+            })
+            continue
+
+        # Wrap with anchor flag + boundary counts.
+        out_messages = []
+        messages_before = 0
+        messages_after = 0
+        for m in messages:
+            is_anchor = m.get("id") == a_msg_id
+            if not is_anchor and m.get("id", 0) < a_msg_id:
+                messages_before += 1
+            elif not is_anchor:
+                messages_after += 1
+            entry = {
+                "id": m.get("id"),
+                "role": m.get("role"),
+                "content": m.get("content"),
+                "tool_name": m.get("tool_name"),
+                "tool_calls": m.get("tool_calls") or None,
+                "tool_call_id": m.get("tool_call_id"),
+                "timestamp": m.get("timestamp"),
+            }
+            if is_anchor:
+                entry["anchor"] = True
+            # Strip None-valued optional fields to keep payload tight (keep
+            # 'content' even if None, since absent-content is meaningful).
+            entry = {k: v for k, v in entry.items() if v is not None or k in ("content",)}
+            out_messages.append(entry)
+
+        windows_out.append({
+            "success": True,
+            "session_id": a_sid,
+            "around_message_id": a_msg_id,
+            "session_meta": {
+                "when": _format_timestamp(session_meta.get("started_at")),
+                "source": session_meta.get("source"),
+                "model": session_meta.get("model"),
+                "title": session_meta.get("title"),
+            },
+            "messages": out_messages,
+            "messages_before": messages_before,
+            "messages_after": messages_after,
         })
-        # Strip None-valued optional fields to keep payload tight
-        out_messages[-1] = {k: v for k, v in out_messages[-1].items() if v is not None or k in ("content",)}
 
-    return json.dumps({
+    # 5. Top-level response shape. ``windows`` is always a list. For
+    #    single-anchor calls (the common case), we mirror the legacy fields
+    #    at the top level so existing callers / tests continue to work
+    #    without branching on len(windows).
+    response: Dict[str, Any] = {
         "success": True,
         "mode": "guided",
-        "session_id": session_id,
-        "around_message_id": around_id,
         "window": window,
-        "session_meta": {
-            "when": _format_timestamp(session_meta.get("started_at")),
-            "source": session_meta.get("source"),
-            "model": session_meta.get("model"),
-            "title": session_meta.get("title"),
-        },
-        "messages": out_messages,
-        "messages_before": messages_before,
-        "messages_after": messages_after,
-    }, ensure_ascii=False)
+        "windows": windows_out,
+        "anchor_count": len(windows_out),
+    }
+    if len(windows_out) == 1:
+        only = windows_out[0]
+        if only.get("success"):
+            response.update({
+                "session_id": only["session_id"],
+                "around_message_id": only["around_message_id"],
+                "session_meta": only["session_meta"],
+                "messages": only["messages"],
+                "messages_before": only["messages_before"],
+                "messages_after": only["messages_after"],
+            })
+        else:
+            # Single-anchor failure: surface as a top-level tool_error so
+            # callers don't have to dig into the windows array for the
+            # error string. Keeps the legacy single-anchor failure shape.
+            return tool_error(only.get("error", "guided drill-down failed"), success=False)
+
+    return json.dumps(response, ensure_ascii=False)
 
 
 def session_search(
@@ -473,11 +577,14 @@ def session_search(
     db=None,
     current_session_id: str = None,
     mode: str = "summary",
-    # Guided-mode-only parameters: anchored drill-down into one session at one
-    # specific message id. Required when mode='guided', ignored otherwise.
+    # Guided-mode-only parameters: anchored drill-down into one or more
+    # session+message pairs. Required when mode='guided', ignored otherwise.
+    # Use either the single-anchor pair (session_id + around_message_id) or
+    # the multi-anchor list (anchors=[{session_id, around_message_id}, ...]).
     session_id: str = None,
     around_message_id: int = None,
     window: int = 5,
+    anchors: list = None,
 ) -> str:
     """
     Search past sessions, or drill into a specific one.
@@ -519,6 +626,7 @@ def session_search(
             around_message_id=around_message_id,
             window=window,
             current_session_id=current_session_id,
+            anchors=anchors,
         )
 
     # Defensive: models (especially open-source) may send non-int limit values
@@ -834,15 +942,27 @@ SESSION_SEARCH_SCHEMA = {
             },
             "session_id": {
                 "type": "string",
-                "description": "Required for mode='guided'. The session to drill into. Copy from a prior fast-mode result.",
+                "description": "Single-anchor mode='guided'. The session to drill into. Copy from a prior fast-mode result. Use this OR 'anchors' (not both).",
             },
             "around_message_id": {
                 "type": "integer",
-                "description": "Required for mode='guided'. The message id to anchor the window on. Copy from a prior fast-mode result's match_message_id field.",
+                "description": "Single-anchor mode='guided'. The message id to anchor the window on. Copy from a prior fast-mode result's match_message_id field. Use this OR 'anchors' (not both).",
+            },
+            "anchors": {
+                "type": "array",
+                "description": "Multi-anchor mode='guided'. A list of {session_id, around_message_id} dicts to drill into all at once. Use this when a wider fast call returned multiple promising hits and the user (or you) wants to inspect several at the same time. Each anchor produces its own window in the response's 'windows' array.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "around_message_id": {"type": "integer"},
+                    },
+                    "required": ["session_id", "around_message_id"],
+                },
             },
             "window": {
                 "type": "integer",
-                "description": "Mode='guided' only. Number of messages to return on each side of the anchor (anchor itself is always included). Clamped to [1, 20]. Default 5.",
+                "description": "Mode='guided' only. Number of messages to return on each side of each anchor (the anchor itself is always included). Shared across all anchors in a multi-anchor call. Clamped to [1, 20]. Default 5.",
                 "default": 5,
             },
         },
@@ -866,6 +986,7 @@ registry.register(
         session_id=args.get("session_id"),
         around_message_id=args.get("around_message_id"),
         window=args.get("window", 5),
+        anchors=args.get("anchors"),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id")),
     check_fn=check_session_search_requirements,

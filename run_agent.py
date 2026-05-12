@@ -10299,6 +10299,7 @@ class AIAgent:
                 session_id=function_args.get("session_id"),
                 around_message_id=function_args.get("around_message_id"),
                 window=function_args.get("window", 5),
+                anchors=function_args.get("anchors"),
             )
         elif function_name == "memory":
             target = function_args.get("target", "memory")
@@ -10929,6 +10930,7 @@ class AIAgent:
                         session_id=function_args.get("session_id"),
                         around_message_id=function_args.get("around_message_id"),
                         window=function_args.get("window", 5),
+                        anchors=function_args.get("anchors"),
                     )
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():

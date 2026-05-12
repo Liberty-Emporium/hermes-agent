@@ -643,6 +643,7 @@ class TestSessionSearch:
         # And both dispatch sites carry the guided-mode handles
         assert source.count('around_message_id=function_args.get("around_message_id")') == 2
         assert source.count('window=function_args.get("window", 5)') == 2
+        assert source.count('anchors=function_args.get("anchors")') == 2
 
     def test_current_child_session_excludes_parent_lineage(self):
         """Compression/delegation parents should be excluded for the active child session."""
@@ -1098,3 +1099,257 @@ class TestGuidedMode:
         assert "session_id" in props
         assert "around_message_id" in props
         assert "window" in props
+        assert "anchors" in props
+
+
+class TestGuidedModeMultiAnchor:
+    """Tests for the multi-anchor guided shape (anchors=[...]).
+
+    The agent calls fast with a wider limit, picks the most promising K hits,
+    and drills into all of them in a single guided call. Each anchor produces
+    its own window in the response's 'windows' array.
+    """
+
+    def _make_db(self):
+        from unittest.mock import MagicMock
+
+        db = MagicMock()
+        return db
+
+    def _stub_session(self, db, session_id):
+        """Configure db.get_session to return valid metadata for this session_id."""
+        existing = db.get_session.side_effect
+        configured = getattr(self, "_configured_sessions", {})
+        configured[session_id] = {
+            "id": session_id,
+            "parent_session_id": None,
+            "source": "cli",
+            "started_at": 1709400000,
+            "model": "test-model",
+            "title": f"Session {session_id}",
+        }
+        self._configured_sessions = configured
+
+        def lookup(sid):
+            return configured.get(sid)
+
+        db.get_session.side_effect = lookup
+
+    def test_two_anchors_both_succeed_returns_two_windows(self):
+        from tools.session_search_tool import session_search
+
+        db = self._make_db()
+        self._stub_session(db, "sid_A")
+        self._stub_session(db, "sid_B")
+
+        # Distinct windows per anchor
+        def get_messages_around(session_id, around_id, window):
+            if session_id == "sid_A" and around_id == 100:
+                return [
+                    {"id": 99,  "role": "user",      "content": "A-before"},
+                    {"id": 100, "role": "assistant", "content": "A-anchor"},
+                    {"id": 101, "role": "tool",      "content": "A-after"},
+                ]
+            if session_id == "sid_B" and around_id == 200:
+                return [
+                    {"id": 199, "role": "user",      "content": "B-before"},
+                    {"id": 200, "role": "assistant", "content": "B-anchor"},
+                    {"id": 201, "role": "tool",      "content": "B-after"},
+                ]
+            return []
+
+        db.get_messages_around.side_effect = get_messages_around
+
+        result = json.loads(session_search(
+            query="",
+            db=db,
+            mode="guided",
+            anchors=[
+                {"session_id": "sid_A", "around_message_id": 100},
+                {"session_id": "sid_B", "around_message_id": 200},
+            ],
+            window=1,
+        ))
+
+        assert result["success"] is True
+        assert result["mode"] == "guided"
+        assert result["anchor_count"] == 2
+        assert len(result["windows"]) == 2
+
+        # Both windows succeeded, each with the right anchor flagged
+        win_a = next(w for w in result["windows"] if w["session_id"] == "sid_A")
+        win_b = next(w for w in result["windows"] if w["session_id"] == "sid_B")
+        assert win_a["success"] is True and win_b["success"] is True
+        assert win_a["around_message_id"] == 100
+        assert win_b["around_message_id"] == 200
+        # Anchor flag on the right row in each window
+        anchors_a = [m for m in win_a["messages"] if m.get("anchor")]
+        anchors_b = [m for m in win_b["messages"] if m.get("anchor")]
+        assert len(anchors_a) == 1 and anchors_a[0]["id"] == 100
+        assert len(anchors_b) == 1 and anchors_b[0]["id"] == 200
+        # Multi-anchor responses do NOT mirror a top-level session_id
+        assert "session_id" not in result
+        assert "messages" not in result
+
+        # DB called once per anchor with the shared window
+        assert db.get_messages_around.call_count == 2
+
+    def test_one_anchor_fails_other_succeeds_does_not_abort(self):
+        """Per-anchor failures become inline error entries; valid anchors still drill."""
+        from tools.session_search_tool import session_search
+
+        db = self._make_db()
+        # Only sid_A exists; sid_BAD is not stubbed
+        self._stub_session(db, "sid_A")
+
+        def get_messages_around(session_id, around_id, window):
+            if session_id == "sid_A":
+                return [{"id": 100, "role": "user", "content": "anchor"}]
+            return []
+
+        db.get_messages_around.side_effect = get_messages_around
+
+        result = json.loads(session_search(
+            query="",
+            db=db,
+            mode="guided",
+            anchors=[
+                {"session_id": "sid_A", "around_message_id": 100},
+                {"session_id": "sid_BAD", "around_message_id": 999},
+            ],
+        ))
+
+        # Top-level reports overall success because at least one anchor drilled
+        assert result["success"] is True
+        assert result["anchor_count"] == 2
+
+        # First window succeeded, second window has an error entry
+        win_a = next(w for w in result["windows"] if w.get("session_id") == "sid_A")
+        win_bad = next(w for w in result["windows"] if w.get("session_id") == "sid_BAD")
+        assert win_a["success"] is True
+        assert win_bad["success"] is False
+        assert "not found" in win_bad["error"].lower()
+
+    def test_single_anchor_via_anchors_list_normalises_to_legacy_shape(self):
+        """anchors=[{...}] with one entry should produce the same top-level
+        response shape as the legacy session_id+around_message_id call."""
+        from tools.session_search_tool import session_search
+
+        db = self._make_db()
+        self._stub_session(db, "sid_A")
+        db.get_messages_around.return_value = [
+            {"id": 100, "role": "user", "content": "anchor"},
+        ]
+
+        result = json.loads(session_search(
+            query="",
+            db=db,
+            mode="guided",
+            anchors=[{"session_id": "sid_A", "around_message_id": 100}],
+        ))
+
+        # Single-anchor mirroring: legacy fields present at the top level
+        assert result["success"] is True
+        assert result["session_id"] == "sid_A"
+        assert result["around_message_id"] == 100
+        assert "messages" in result
+        assert "session_meta" in result
+        assert result["anchor_count"] == 1
+        # And the windows array is also present
+        assert len(result["windows"]) == 1
+
+    def test_empty_anchors_list_returns_tool_error(self):
+        from tools.session_search_tool import session_search
+
+        db = self._make_db()
+
+        result = json.loads(session_search(
+            query="",
+            db=db,
+            mode="guided",
+            anchors=[],
+            session_id=None,
+            around_message_id=None,
+        ))
+
+        assert result["success"] is False
+        assert "anchor" in result["error"].lower()
+
+    def test_anchors_non_list_returns_tool_error(self):
+        from tools.session_search_tool import session_search
+
+        db = self._make_db()
+
+        result = json.loads(session_search(
+            query="",
+            db=db,
+            mode="guided",
+            anchors="not_a_list",
+        ))
+
+        assert result["success"] is False
+        assert "list" in result["error"].lower()
+
+    def test_window_clamp_shared_across_anchors(self):
+        """Window is shared across all anchors and clamped once."""
+        from tools.session_search_tool import session_search
+
+        db = self._make_db()
+        self._stub_session(db, "sid_A")
+        self._stub_session(db, "sid_B")
+        db.get_messages_around.return_value = [
+            {"id": 100, "role": "user", "content": "anchor"},
+        ]
+
+        result = json.loads(session_search(
+            query="",
+            db=db,
+            mode="guided",
+            anchors=[
+                {"session_id": "sid_A", "around_message_id": 100},
+                {"session_id": "sid_B", "around_message_id": 200},
+            ],
+            window=999,  # clamped to 20
+        ))
+
+        assert result["window"] == 20
+        # Both DB calls used the clamped window
+        for call_args in db.get_messages_around.call_args_list:
+            assert call_args.kwargs.get("window") == 20
+
+    def test_per_anchor_current_lineage_rejection(self):
+        """One anchor can be in the current lineage and rejected while another succeeds."""
+        from tools.session_search_tool import session_search
+
+        db = self._make_db()
+        # sid_root is the parent of the current session; drilling there should be rejected
+        # sid_other is unrelated and should succeed
+        configured = {
+            "child":     {"id": "child",     "parent_session_id": "sid_root"},
+            "sid_root":  {"id": "sid_root",  "parent_session_id": None,
+                          "source": "cli", "started_at": 1709400000, "model": "test-model"},
+            "sid_other": {"id": "sid_other", "parent_session_id": None,
+                          "source": "cli", "started_at": 1709400000, "model": "test-model"},
+        }
+        db.get_session.side_effect = configured.get
+        db.get_messages_around.return_value = [
+            {"id": 100, "role": "user", "content": "anchor"},
+        ]
+
+        result = json.loads(session_search(
+            query="",
+            db=db,
+            mode="guided",
+            anchors=[
+                {"session_id": "sid_root",  "around_message_id": 100},
+                {"session_id": "sid_other", "around_message_id": 100},
+            ],
+            current_session_id="child",
+        ))
+
+        assert result["success"] is True  # at least one anchor drilled
+        rejected = next(w for w in result["windows"] if w.get("session_id") == "sid_root")
+        accepted = next(w for w in result["windows"] if w.get("session_id") == "sid_other")
+        assert rejected["success"] is False
+        assert "current session" in rejected["error"].lower()
+        assert accepted["success"] is True
