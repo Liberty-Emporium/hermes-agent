@@ -208,7 +208,7 @@ jobs:
             --publish never \
             --config.extraMetadata.version="${DESKTOP_VERSION}" \
             --config.extraMetadata.desktopChannel="${DESKTOP_CHANNEL}" \
-            '--config.artifactName=Hermes-${version}-${env.DESKTOP_CHANNEL}-${os}-${arch}.${ext}'
+            "--config.artifactName=Hermes-${DESKTOP_VERSION}-${DESKTOP_CHANNEL}-\${os}-\${arch}.\${ext}"
 
       - name: Notarize and staple macOS DMG
         if: matrix.platform == 'mac' && needs.prepare.outputs.is_stable == 'true'
