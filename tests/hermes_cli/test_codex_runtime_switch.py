@@ -147,3 +147,48 @@ class TestApply:
         assert r.success is False
         assert "persist failed" in r.message
         assert "disk full" in r.message
+
+    def test_enable_triggers_mcp_migration(self):
+        """Enabling codex_app_server should auto-migrate Hermes mcp_servers
+        to ~/.codex/config.toml so the spawned subprocess sees them."""
+        cfg = {
+            "mcp_servers": {
+                "filesystem": {"command": "npx", "args": ["-y", "fs-server"]},
+            }
+        }
+
+        with patch.object(crs, "check_codex_binary_ok",
+                          return_value=(True, "0.130.0")), \
+             patch("hermes_cli.codex_runtime_plugin_migration.migrate") as mig:
+            mig.return_value.migrated = ["filesystem"]
+            mig.return_value.errors = []
+            mig.return_value.target_path = "/fake/.codex/config.toml"
+            r = crs.apply(cfg, "codex_app_server")
+        assert r.success
+        assert mig.called  # migration was triggered
+        assert "Migrated 1 MCP server" in r.message
+
+    def test_disable_does_not_trigger_migration(self):
+        """Switching back to auto must not write to ~/.codex/."""
+        cfg = {
+            "model": {"openai_runtime": "codex_app_server"},
+            "mcp_servers": {"x": {"command": "y"}},
+        }
+        with patch("hermes_cli.codex_runtime_plugin_migration.migrate") as mig:
+            r = crs.apply(cfg, "auto")
+        assert r.success
+        assert not mig.called  # disabling does not migrate
+
+    def test_migration_failure_does_not_block_enable(self):
+        """If MCP migration raises, the runtime change still proceeds —
+        users can manually re-run migration later."""
+        cfg = {"mcp_servers": {"x": {"command": "y"}}}
+        with patch.object(crs, "check_codex_binary_ok",
+                          return_value=(True, "0.130.0")), \
+             patch("hermes_cli.codex_runtime_plugin_migration.migrate",
+                   side_effect=RuntimeError("disk full")):
+            r = crs.apply(cfg, "codex_app_server")
+        assert r.success  # change still applied
+        assert r.new_value == "codex_app_server"
+        assert "MCP migration skipped" in r.message
+        assert "disk full" in r.message

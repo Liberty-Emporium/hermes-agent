@@ -180,6 +180,26 @@ def apply(
         ok, ver = check_codex_binary_ok()
         if ok:
             msg_lines.append(f"codex CLI: {ver}")
+        # Auto-migrate Hermes' MCP servers into ~/.codex/config.toml so
+        # the spawned codex subprocess sees the same tool surface. Failures
+        # here are non-fatal — the runtime change still proceeds.
+        try:
+            from hermes_cli.codex_runtime_plugin_migration import migrate
+            mig_report = migrate(config)
+            if mig_report.migrated:
+                msg_lines.append(
+                    f"Migrated {len(mig_report.migrated)} MCP server(s) "
+                    f"to {mig_report.target_path}"
+                )
+            elif mig_report.target_path:
+                msg_lines.append(
+                    f"No MCP servers to migrate "
+                    f"(wrote placeholder to {mig_report.target_path})"
+                )
+            for err in mig_report.errors:
+                msg_lines.append(f"⚠ MCP migration: {err}")
+        except Exception as exc:
+            msg_lines.append(f"⚠ MCP migration skipped: {exc}")
         msg_lines.append(
             "OpenAI/Codex turns now run through `codex app-server` "
             "(terminal/file ops/patching inside Codex)."
