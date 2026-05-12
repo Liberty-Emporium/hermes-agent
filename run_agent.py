@@ -1201,7 +1201,7 @@ class AIAgent:
         self.provider = provider_name or ""
         self.acp_command = acp_command or command
         self.acp_args = list(acp_args or args or [])
-        if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse"}:
+        if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
             self.api_mode = api_mode
         elif self.provider == "openai-codex":
             self.api_mode = "codex_responses"
@@ -12035,6 +12035,19 @@ class AIAgent:
             except Exception:
                 pass
 
+        # Optional opt-in runtime: if api_mode == codex_app_server, hand the
+        # turn to the codex app-server subprocess (terminal/file ops/patching
+        # all run inside Codex). Default Hermes path is bypassed entirely.
+        # See agent/transports/codex_app_server_session.py for the adapter
+        # and references/codex-app-server-runtime.md for the rationale.
+        if self.api_mode == "codex_app_server":
+            return self._run_codex_app_server_turn(
+                user_message=user_message,
+                original_user_message=original_user_message,
+                messages=messages,
+                effective_task_id=effective_task_id,
+            )
+
         while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call:
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot
             self._checkpoint_mgr.new_turn()
@@ -15479,6 +15492,97 @@ class AIAgent:
         """
         result = self.run_conversation(message, stream_callback=stream_callback)
         return result["final_response"]
+
+    def _run_codex_app_server_turn(
+        self,
+        *,
+        user_message: str,
+        original_user_message: Any,
+        messages: List[Dict[str, Any]],
+        effective_task_id: str,
+    ) -> Dict[str, Any]:
+        """Codex app-server runtime path. Hands the entire turn to a `codex
+        app-server` subprocess and projects its events back into Hermes'
+        messages list so memory/skill review keep working.
+
+        Called from run_conversation() when self.api_mode == "codex_app_server".
+        Returns the same dict shape as the chat_completions path.
+        """
+        from agent.transports.codex_app_server_session import CodexAppServerSession
+
+        # Lazy session: one CodexAppServerSession per AIAgent instance.
+        # Spawned on first turn, reused across turns, closed at AIAgent
+        # shutdown (see _cleanup hook).
+        if not hasattr(self, "_codex_session") or self._codex_session is None:
+            cwd = getattr(self, "session_cwd", None) or os.getcwd()
+            # Approval callback: defer to Hermes' standard prompt flow if a
+            # CLI thread has installed one. Gateway / cron contexts get the
+            # codex-side fail-closed default.
+            try:
+                from tools.terminal_tool import _get_approval_callback
+                approval_callback = _get_approval_callback()
+            except Exception:
+                approval_callback = None
+            self._codex_session = CodexAppServerSession(
+                cwd=cwd,
+                approval_callback=approval_callback,
+            )
+
+        # NOTE: the user message is ALREADY appended to messages by the
+        # standard run_conversation() flow (line ~11823) before the early
+        # return reaches us. Do NOT append again — that would duplicate.
+
+        try:
+            turn = self._codex_session.run_turn(user_input=user_message)
+        except Exception as exc:
+            logger.exception("codex app-server turn failed")
+            return {
+                "final_response": (
+                    f"Codex app-server turn failed: {exc}. "
+                    f"Fall back to default runtime with `/codex-runtime auto`."
+                ),
+                "messages": messages,
+                "api_calls": 0,
+                "completed": False,
+                "partial": True,
+                "error": str(exc),
+            }
+
+        # Splice projected messages into the conversation. The projector emits
+        # standard {role, content, tool_calls, tool_call_id} entries, which
+        # is exactly what curator.py / sessions DB expect.
+        if turn.projected_messages:
+            messages.extend(turn.projected_messages)
+
+        # Counter ticks for the self-improvement loop.
+        # _turns_since_memory and _user_turn_count are ALREADY incremented
+        # in the run_conversation() pre-loop block (lines ~11793-11817) so we
+        # do NOT touch them here — that would double-count.
+        # Only _iters_since_skill needs explicit increment, since the
+        # chat_completions loop bumps it per tool iteration (line ~12110)
+        # and that loop is bypassed on this path.
+        self._iters_since_skill = (
+            getattr(self, "_iters_since_skill", 0) + turn.tool_iterations
+        )
+
+        # Fire the background review fork on the same cadence as the default
+        # path. _spawn_background_review reads the messages list snapshot, so
+        # it works identically here.
+        try:
+            self._spawn_background_review()
+        except Exception:
+            logger.debug("background review spawn raised", exc_info=True)
+
+        return {
+            "final_response": turn.final_text,
+            "messages": messages,
+            "api_calls": 1,  # one app-server "turn" maps to one logical API call
+            "completed": not turn.interrupted and turn.error is None,
+            "partial": turn.interrupted or turn.error is not None,
+            "error": turn.error,
+            "codex_thread_id": turn.thread_id,
+            "codex_turn_id": turn.turn_id,
+        }
 
 
 def main(
