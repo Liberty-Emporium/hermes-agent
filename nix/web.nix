@@ -3,8 +3,7 @@
 let
   src = ../apps;
   npmDeps = pkgs.fetchNpmDeps {
-    inherit src;
-    npmRoot = "dashboard";
+    src = ../apps/dashboard;
     hash = "sha256-jJsVp3Dz+6/GaruxcUSby+G1vVB+nHHlu1tFWE9wQZQ=";
   };
 
