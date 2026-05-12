@@ -459,6 +459,7 @@ def session_search(
                     "source": session_meta.get("source") or match_info.get("source", "unknown"),
                     "model": session_meta.get("model") or match_info.get("model") or "unknown",
                     "matched_role": match_info.get("role"),
+                    "match_message_id": match_info.get("id"),
                     "title": session_meta.get("title") or None,
                     "snippet": snippet,
                     "context": context,

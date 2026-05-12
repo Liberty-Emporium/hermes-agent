@@ -489,6 +489,36 @@ class TestSessionSearch:
         assert entry["context"][1]["content"] == "the LLM summary is the bottleneck"
         mock_db.get_messages_as_conversation.assert_not_called()
 
+    def test_fast_mode_includes_match_message_id_for_guided_drilldown(self):
+        """Fast-mode results must surface the FTS5 message id as ``match_message_id``
+        so the agent can pass it back as ``around_message_id`` for a follow-up
+        ``mode='guided'`` call. This is the discover → drill composition handle."""
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {
+                "id": 987654,
+                "session_id": "other_sid",
+                "role": "assistant",
+                "snippet": "...the >>>final design<<< was...",
+                "context": [],
+                "source": "cli",
+                "session_started": 1709400000,
+                "model": "test-model",
+            },
+        ]
+        mock_db.get_session.return_value = {"parent_session_id": None}
+
+        result = json.loads(session_search(query="final design", db=mock_db, mode="fast"))
+
+        entry = result["results"][0]
+        assert entry["match_message_id"] == 987654
+        # Sanity: still also surfaces session_id so the agent has both pieces
+        # needed to compose a guided call
+        assert entry["session_id"] == "other_sid"
+
     @pytest.mark.parametrize("mode", ["summarized", "summarise", "summarize", "deep"])
     def test_summary_mode_aliases_use_llm_summarization_path(self, monkeypatch, mode):
         """Common natural-language mode aliases should map to summary mode."""
