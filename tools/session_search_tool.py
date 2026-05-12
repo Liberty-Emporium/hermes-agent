@@ -319,17 +319,177 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str
         return tool_error(f"Failed to list recent sessions: {e}", success=False)
 
 
+def _guided_drill_down(
+    db,
+    session_id: str,
+    around_message_id,
+    window: int,
+    current_session_id: str = None,
+) -> str:
+    """Anchored drill-down for ``mode='guided'`` of ``session_search``.
+
+    Returns a JSON string carrying a window of messages around a specific
+    message id in a specific session. No FTS5, no auxiliary LLM, no
+    100k-char truncation — one DB query.
+
+    Validates: required args, session existence, anchor-in-session,
+    current-lineage exclusion (the active session's history is already
+    in the agent's context so a drill-in there is wasted), and clamps
+    ``window`` to ``[1, 20]``.
+    """
+    # 1. Required-arg validation. tool_error() preserves consistent shape with
+    #    the rest of session_search; missing args are user-facing failures.
+    if not session_id or not isinstance(session_id, str) or not session_id.strip():
+        return tool_error(
+            "guided mode requires session_id (use match_message_id+session_id "
+            "from a prior fast-mode hit)",
+            success=False,
+        )
+    session_id = session_id.strip()
+
+    # around_message_id may arrive as int or stringified int (open-source
+    # models love stringifying numerics); coerce defensively.
+    try:
+        around_id = int(around_message_id)
+    except (TypeError, ValueError):
+        return tool_error(
+            "guided mode requires around_message_id as an integer "
+            "(use match_message_id from a prior fast-mode hit)",
+            success=False,
+        )
+
+    # 2. Window clamp. Matches the existing limit-clamp pattern (silent).
+    if not isinstance(window, int):
+        try:
+            window = int(window)
+        except (TypeError, ValueError):
+            window = 5
+    window = max(1, min(window, 20))
+
+    # 3. Skip current-lineage drill-down. The agent already has the active
+    #    session's messages in its context — a drill-in there returns
+    #    information it already has.
+    def _resolve_to_parent(sid: str) -> str:
+        visited = set()
+        cur = sid
+        while cur and cur not in visited:
+            visited.add(cur)
+            try:
+                meta = db.get_session(cur)
+                if not meta:
+                    break
+                parent = meta.get("parent_session_id")
+                if parent:
+                    cur = parent
+                else:
+                    break
+            except Exception as e:
+                logging.debug("Error resolving parent for %s: %s", cur, e, exc_info=True)
+                break
+        return cur
+
+    if current_session_id:
+        current_root = _resolve_to_parent(current_session_id)
+        target_root = _resolve_to_parent(session_id)
+        if current_root and current_root == target_root:
+            return tool_error(
+                "guided mode rejects drill-down into the current session "
+                "lineage — those messages are already in your active context",
+                success=False,
+            )
+
+    # 4. Session existence check (separate from the anchor-in-session check
+    #    so we can return a more specific error message).
+    try:
+        session_meta = db.get_session(session_id) or {}
+    except Exception as e:
+        logging.debug("get_session failed for %s: %s", session_id, e, exc_info=True)
+        session_meta = {}
+    if not session_meta:
+        return tool_error(f"session_id not found: {session_id}", success=False)
+
+    # 5. Fetch the window. get_messages_around() returns [] if the anchor
+    #    isn't in this session — translate to a specific error.
+    try:
+        messages = db.get_messages_around(session_id, around_id, window=window)
+    except Exception as e:
+        logging.debug("get_messages_around failed: %s", e, exc_info=True)
+        return tool_error(
+            f"failed to load messages around {around_id} in {session_id}: {e}",
+            success=False,
+        )
+    if not messages:
+        return tool_error(
+            f"around_message_id {around_id} not in session_id {session_id}",
+            success=False,
+        )
+
+    # 6. Wrap with anchor flag + boundary counts so the agent can see "this is
+    #    everything available" without a follow-up call.
+    out_messages = []
+    messages_before = 0
+    messages_after = 0
+    for m in messages:
+        is_anchor = m.get("id") == around_id
+        if not is_anchor and m.get("id", 0) < around_id:
+            messages_before += 1
+        elif not is_anchor:
+            messages_after += 1
+        out_messages.append({
+            "id": m.get("id"),
+            "role": m.get("role"),
+            "content": m.get("content"),
+            "tool_name": m.get("tool_name"),
+            "tool_calls": m.get("tool_calls") or None,
+            "tool_call_id": m.get("tool_call_id"),
+            "timestamp": m.get("timestamp"),
+            **({"anchor": True} if is_anchor else {}),
+        })
+        # Strip None-valued optional fields to keep payload tight
+        out_messages[-1] = {k: v for k, v in out_messages[-1].items() if v is not None or k in ("content",)}
+
+    return json.dumps({
+        "success": True,
+        "mode": "guided",
+        "session_id": session_id,
+        "around_message_id": around_id,
+        "window": window,
+        "session_meta": {
+            "when": _format_timestamp(session_meta.get("started_at")),
+            "source": session_meta.get("source"),
+            "model": session_meta.get("model"),
+            "title": session_meta.get("title"),
+        },
+        "messages": out_messages,
+        "messages_before": messages_before,
+        "messages_after": messages_after,
+    }, ensure_ascii=False)
+
+
 def session_search(
-    query: str,
+    query: str = "",
     role_filter: str = None,
     limit: int = 3,
     db=None,
     current_session_id: str = None,
     mode: str = "summary",
+    # Guided-mode-only parameters: anchored drill-down into one session at one
+    # specific message id. Required when mode='guided', ignored otherwise.
+    session_id: str = None,
+    around_message_id: int = None,
+    window: int = 5,
 ) -> str:
     """
-    Search past sessions. Summary mode (default) returns LLM-generated recaps;
-    fast mode returns FTS snippets without LLM calls for cheap discovery.
+    Search past sessions, or drill into a specific one.
+
+    Modes:
+      * fast    — FTS5 snippets + ±1 message context. Cheap discovery.
+      * summary — fetch full session(s), truncate to 100k chars, run aux LLM
+                  recap. Cross-session synthesis at ~30s tool-side cost.
+      * guided  — anchored drill-down. Caller supplies session_id +
+                  around_message_id (typically from a prior fast hit's
+                  match_message_id field) and gets a window of messages
+                  around the anchor with no LLM call and no truncation.
     """
     if db is None:
         try:
@@ -344,8 +504,22 @@ def session_search(
     mode = (mode or "summary").strip().lower() if isinstance(mode, str) else "summary"
     if mode in ("summarized", "summarise", "summarize", "deep"):
         mode = "summary"
-    if mode not in ("fast", "summary"):
+    if mode in ("drill", "drilldown", "drill-down", "anchor", "around"):
+        mode = "guided"
+    if mode not in ("fast", "summary", "guided"):
         mode = "summary"
+
+    # Guided mode is a different shape: it doesn't search, it drills. Branch
+    # before FTS5 so we don't pay for anything we don't use, and so missing-arg
+    # validation happens up front.
+    if mode == "guided":
+        return _guided_drill_down(
+            db=db,
+            session_id=session_id,
+            around_message_id=around_message_id,
+            window=window,
+            current_session_id=current_session_id,
+        )
 
     # Defensive: models (especially open-source) may send non-int limit values
     # (None when JSON null, string "int", or even a type object).  Coerce to a
@@ -589,16 +763,25 @@ def check_session_search_requirements() -> bool:
 SESSION_SEARCH_SCHEMA = {
     "name": "session_search",
     "description": (
-        "Search your long-term memory of past conversations, or browse recent sessions. This is your recall -- "
-        "every past session is searchable.\n\n"
-        "TWO MODES:\n"
+        "Search your long-term memory of past conversations, browse recent sessions, or drill "
+        "into a specific session. This is your recall -- every past session is searchable.\n\n"
+        "MODES:\n"
         "1. Recent sessions (no query): Call with no arguments to see what was worked on recently. "
         "Returns titles, previews, and timestamps. Zero LLM cost, instant. "
         "Start here when the user asks what were we working on or what did we do recently.\n"
         "2. Keyword search (with query): Search for specific topics across all past sessions. "
         "Defaults to mode='summary', returning LLM-generated recaps of the matched sessions (the recall "
         "you usually want). Set mode='fast' for cheap, instant FTS snippet hits when you only need to "
-        "discover which sessions touched a topic.\n\n"
+        "discover which sessions touched a topic.\n"
+        "3. Drill-down (mode='guided'): When a fast-mode result looks promising but you need the "
+        "actual conversation around it, call again with mode='guided', session_id from the result, "
+        "and around_message_id=match_message_id from the same result. Returns a window of messages "
+        "around the anchor (no LLM, no truncation, ~ms latency).\n\n"
+        "RECOMMENDED FLOWS:\n"
+        "- 'what did we decide about X?' → mode='summary' (synthesised recall)\n"
+        "- 'find the latest session about Y' → mode='fast' (cheap discovery)\n"
+        "- 'I see the fast hit but want the actual back-and-forth' → mode='guided' "
+        "  with session_id+around_message_id from the fast hit\n\n"
         "USE THIS PROACTIVELY when:\n"
         "- The user says 'we did this before', 'remember when', 'last time', 'as I mentioned'\n"
         "- The user asks about a topic you worked on before but don't have in current context\n"
@@ -607,8 +790,9 @@ SESSION_SEARCH_SCHEMA = {
         "- The user asks 'what did we do about X?' or 'how did we fix Y?'\n\n"
         "Don't hesitate to search when it is actually cross-session -- summary mode is one tool call away. "
         "Better to search and confirm than to guess or ask the user to repeat themselves.\n\n"
-        "Search syntax: keywords joined with OR for broad recall (elevenlabs OR baseten OR funding), "
-        "phrases for exact match (\"docker networking\"), boolean (python NOT java), prefix (deploy*). "
+        "Search syntax (modes 'fast' and 'summary'): keywords joined with OR for broad recall "
+        "(elevenlabs OR baseten OR funding), phrases for exact match (\"docker networking\"), "
+        "boolean (python NOT java), prefix (deploy*). "
         "IMPORTANT: Use OR between keywords for best results — FTS5 defaults to AND which misses "
         "sessions that only mention some terms. If a broad OR query returns nothing, try individual "
         "keyword searches in parallel."
@@ -618,20 +802,20 @@ SESSION_SEARCH_SCHEMA = {
         "properties": {
             "query": {
                 "type": "string",
-                "description": "Search query — keywords, phrases, or boolean expressions to find in past sessions. Omit this parameter entirely to browse recent sessions instead (returns titles, previews, timestamps with no LLM cost).",
+                "description": "Search query (modes 'fast' and 'summary'). Keywords, phrases, or boolean expressions to find in past sessions. Omit this parameter entirely to browse recent sessions instead. Ignored when mode='guided'.",
             },
             "role_filter": {
                 "type": "string",
-                "description": "Optional: only search messages from specific roles (comma-separated). E.g. 'user,assistant' to skip tool outputs.",
+                "description": "Optional: only search messages from specific roles (comma-separated). E.g. 'user,assistant' to skip tool outputs. Ignored when mode='guided'.",
             },
             "limit": {
                 "type": "integer",
-                "description": "Max sessions to return (default: 3, max: 5).",
+                "description": "Max sessions to return (default: 3, max: 5). Ignored when mode='guided' (which returns one anchored window).",
                 "default": 3,
             },
             "mode": {
                 "type": "string",
-                "enum": ["fast", "summary"],
+                "enum": ["fast", "summary", "guided"],
                 "description": (
                     "summary (default) loads each matched session's transcript and runs the LLM "
                     "summariser to produce a focused recap — ~30s, ~3-4 KB returned per session, "
@@ -641,11 +825,25 @@ SESSION_SEARCH_SCHEMA = {
                     "fast returns FTS5 snippets + 1-message context without any LLM call — ~10ms, "
                     "~1 KB per session, surfaces only what FTS5 directly matched. Use this when the "
                     "user only needs to discover WHICH SESSIONS touched a topic, or when you'll "
-                    "drill into specific sessions yourself afterwards. "
-                    "If a fast result looks promising but lacks detail, you can call again with "
-                    "mode='summary' on the same query."
+                    "drill into specific sessions yourself afterwards (then call again with mode='guided'). "
+                    "guided returns a window of messages around a specific anchor in a specific session "
+                    "— no LLM call, no truncation, ~ms latency. Requires session_id and "
+                    "around_message_id (typically copied from a prior fast hit's match_message_id field)."
                 ),
                 "default": "summary",
+            },
+            "session_id": {
+                "type": "string",
+                "description": "Required for mode='guided'. The session to drill into. Copy from a prior fast-mode result.",
+            },
+            "around_message_id": {
+                "type": "integer",
+                "description": "Required for mode='guided'. The message id to anchor the window on. Copy from a prior fast-mode result's match_message_id field.",
+            },
+            "window": {
+                "type": "integer",
+                "description": "Mode='guided' only. Number of messages to return on each side of the anchor (anchor itself is always included). Clamped to [1, 20]. Default 5.",
+                "default": 5,
             },
         },
         "required": [],
@@ -665,6 +863,9 @@ registry.register(
         role_filter=args.get("role_filter"),
         limit=args.get("limit", 3),
         mode=args.get("mode", "summary"),
+        session_id=args.get("session_id"),
+        around_message_id=args.get("around_message_id"),
+        window=args.get("window", 5),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id")),
     check_fn=check_session_search_requirements,

@@ -637,7 +637,12 @@ class TestSessionSearch:
         from pathlib import Path
 
         source = (Path(__file__).parent.parent.parent / "run_agent.py").read_text()
+        # Both dispatch sites pass mode= as their next-to-last group of kwargs;
+        # the new guided-mode kwargs (session_id/around_message_id/window) follow.
         assert source.count('mode=function_args.get("mode", "summary")') == 2
+        # And both dispatch sites carry the guided-mode handles
+        assert source.count('around_message_id=function_args.get("around_message_id")') == 2
+        assert source.count('window=function_args.get("window", 5)') == 2
 
     def test_current_child_session_excludes_parent_lineage(self):
         """Compression/delegation parents should be excluded for the active child session."""
@@ -815,3 +820,281 @@ class TestSessionSearch:
         assert entry["source"] == "api_server", (
             f"source should be parent's 'api_server', got {entry['source']!r}"
         )
+
+
+# =========================================================================
+# Guided mode — anchored drill-down
+# =========================================================================
+
+class TestGuidedMode:
+    """Tests for mode='guided': drill into a specific session at a specific
+    message id, returning a window of messages around the anchor. The
+    composition flow is: agent calls fast → reads the match_message_id /
+    session_id off a hit → calls back with mode='guided' to read the actual
+    conversation around that point.
+    """
+
+    def _make_db(self):
+        from unittest.mock import MagicMock
+
+        db = MagicMock()
+        # Default session metadata; tests can override via side_effect
+        db.get_session.return_value = {
+            "id": "sid",
+            "parent_session_id": None,
+            "source": "cli",
+            "started_at": 1709400000,
+            "model": "test-model",
+            "title": "Some title",
+        }
+        return db
+
+    def test_returns_window_around_anchor_with_metadata(self):
+        from tools.session_search_tool import session_search
+
+        db = self._make_db()
+        # 5 messages around the anchor (id=200)
+        db.get_messages_around.return_value = [
+            {"id": 198, "role": "user", "content": "before-2"},
+            {"id": 199, "role": "assistant", "content": "before-1"},
+            {"id": 200, "role": "user", "content": "anchor"},
+            {"id": 201, "role": "assistant", "content": "after-1"},
+            {"id": 202, "role": "tool", "content": "after-2", "tool_name": "echo"},
+        ]
+
+        result = json.loads(session_search(
+            query="",
+            db=db,
+            mode="guided",
+            session_id="sid",
+            around_message_id=200,
+            window=2,
+        ))
+
+        assert result["success"] is True
+        assert result["mode"] == "guided"
+        assert result["session_id"] == "sid"
+        assert result["around_message_id"] == 200
+        assert result["window"] == 2
+        assert result["session_meta"]["source"] == "cli"
+        assert result["session_meta"]["model"] == "test-model"
+        assert result["session_meta"]["title"] == "Some title"
+        # Messages preserved in order
+        assert [m["id"] for m in result["messages"]] == [198, 199, 200, 201, 202]
+        # Anchor flagged exactly once on the right row
+        anchor_rows = [m for m in result["messages"] if m.get("anchor")]
+        assert len(anchor_rows) == 1 and anchor_rows[0]["id"] == 200
+        # Boundary counts
+        assert result["messages_before"] == 2
+        assert result["messages_after"] == 2
+        # Crucially: no FTS5, no aux LLM
+        db.search_messages.assert_not_called()
+        db.get_messages_around.assert_called_once_with("sid", 200, window=2)
+
+    def test_missing_session_id_returns_tool_error(self):
+        from tools.session_search_tool import session_search
+
+        db = self._make_db()
+
+        result = json.loads(session_search(
+            query="",
+            db=db,
+            mode="guided",
+            session_id=None,
+            around_message_id=200,
+        ))
+
+        assert result["success"] is False
+        assert "session_id" in result["error"].lower()
+        db.get_messages_around.assert_not_called()
+
+    def test_missing_around_message_id_returns_tool_error(self):
+        from tools.session_search_tool import session_search
+
+        db = self._make_db()
+
+        result = json.loads(session_search(
+            query="",
+            db=db,
+            mode="guided",
+            session_id="sid",
+            around_message_id=None,
+        ))
+
+        assert result["success"] is False
+        assert "around_message_id" in result["error"].lower()
+        db.get_messages_around.assert_not_called()
+
+    def test_window_clamps_to_one_when_zero_or_negative(self):
+        from tools.session_search_tool import session_search
+
+        db = self._make_db()
+        db.get_messages_around.return_value = [
+            {"id": 200, "role": "user", "content": "anchor"},
+        ]
+
+        result = json.loads(session_search(
+            query="",
+            db=db,
+            mode="guided",
+            session_id="sid",
+            around_message_id=200,
+            window=0,
+        ))
+
+        assert result["success"] is True
+        assert result["window"] == 1
+        # Confirm the clamp propagated to the DB call
+        db.get_messages_around.assert_called_once_with("sid", 200, window=1)
+
+    def test_window_clamps_to_twenty_when_too_large(self):
+        from tools.session_search_tool import session_search
+
+        db = self._make_db()
+        db.get_messages_around.return_value = [
+            {"id": 200, "role": "user", "content": "anchor"},
+        ]
+
+        result = json.loads(session_search(
+            query="",
+            db=db,
+            mode="guided",
+            session_id="sid",
+            around_message_id=200,
+            window=999,
+        ))
+
+        assert result["success"] is True
+        assert result["window"] == 20
+        db.get_messages_around.assert_called_once_with("sid", 200, window=20)
+
+    def test_session_id_not_found_returns_tool_error(self):
+        from tools.session_search_tool import session_search
+
+        db = self._make_db()
+        db.get_session.return_value = None  # session doesn't exist
+
+        result = json.loads(session_search(
+            query="",
+            db=db,
+            mode="guided",
+            session_id="missing_sid",
+            around_message_id=200,
+        ))
+
+        assert result["success"] is False
+        assert "not found" in result["error"].lower()
+        # No drill attempted on a non-existent session
+        db.get_messages_around.assert_not_called()
+
+    def test_around_message_id_not_in_session_returns_tool_error(self):
+        from tools.session_search_tool import session_search
+
+        db = self._make_db()
+        db.get_messages_around.return_value = []  # anchor not in session
+
+        result = json.loads(session_search(
+            query="",
+            db=db,
+            mode="guided",
+            session_id="sid",
+            around_message_id=999999,
+        ))
+
+        assert result["success"] is False
+        assert "around_message_id" in result["error"].lower()
+
+    def test_at_session_boundary_returns_partial_window(self):
+        from tools.session_search_tool import session_search
+
+        db = self._make_db()
+        # Anchor near start of session — only 2 messages available before
+        db.get_messages_around.return_value = [
+            {"id": 1, "role": "user", "content": "first"},
+            {"id": 2, "role": "assistant", "content": "second"},
+            {"id": 3, "role": "user", "content": "anchor"},
+            {"id": 4, "role": "assistant", "content": "after-1"},
+            {"id": 5, "role": "user", "content": "after-2"},
+        ]
+
+        result = json.loads(session_search(
+            query="",
+            db=db,
+            mode="guided",
+            session_id="sid",
+            around_message_id=3,
+            window=5,  # asked for 5 each side, only 2 exist on the before side
+        ))
+
+        assert result["success"] is True
+        assert result["messages_before"] == 2
+        assert result["messages_after"] == 2
+        # Anchor is on the right row even with partial window
+        anchor_rows = [m for m in result["messages"] if m.get("anchor")]
+        assert len(anchor_rows) == 1 and anchor_rows[0]["id"] == 3
+
+    def test_rejects_drill_into_current_session_lineage(self):
+        """If the agent asks to drill into the very session it's running in,
+        return tool_error — those messages are already in its active context.
+        Same convention as fast/summary's _resolve_to_parent skip.
+        """
+        from tools.session_search_tool import session_search
+
+        db = self._make_db()
+        # current session = "child", parent = "root"
+        # request drill into "root" → should be rejected (same lineage)
+        def _get_session(sid):
+            if sid == "child":
+                return {"id": "child", "parent_session_id": "root"}
+            if sid == "root":
+                return {"id": "root", "parent_session_id": None,
+                        "source": "cli", "started_at": 1709400000, "model": "test-model"}
+            return None
+
+        db.get_session.side_effect = _get_session
+
+        result = json.loads(session_search(
+            query="",
+            db=db,
+            mode="guided",
+            session_id="root",
+            around_message_id=200,
+            current_session_id="child",
+        ))
+
+        assert result["success"] is False
+        assert "current session" in result["error"].lower()
+        db.get_messages_around.assert_not_called()
+
+    def test_aliases_drill_drilldown_anchor_around_normalize_to_guided(self):
+        from tools.session_search_tool import session_search
+
+        db = self._make_db()
+        db.get_messages_around.return_value = [
+            {"id": 200, "role": "user", "content": "anchor"},
+        ]
+
+        for alias in ("drill", "drilldown", "drill-down", "anchor", "around"):
+            result = json.loads(session_search(
+                query="",
+                db=db,
+                mode=alias,
+                session_id="sid",
+                around_message_id=200,
+            ))
+            assert result["mode"] == "guided", f"alias {alias!r} did not map to guided"
+
+    def test_schema_advertises_guided_mode(self):
+        from tools.session_search_tool import SESSION_SEARCH_SCHEMA
+
+        mode_param = SESSION_SEARCH_SCHEMA["parameters"]["properties"]["mode"]
+        assert "guided" in mode_param["enum"]
+        # Description teaches the discover→drill flow
+        desc = SESSION_SEARCH_SCHEMA["description"]
+        assert "guided" in desc.lower()
+        assert "match_message_id" in desc
+        # Guided-mode-only parameters present
+        props = SESSION_SEARCH_SCHEMA["parameters"]["properties"]
+        assert "session_id" in props
+        assert "around_message_id" in props
+        assert "window" in props
