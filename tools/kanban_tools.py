@@ -160,7 +160,7 @@ def _normalize_profile(value: Any) -> Optional[str]:
     if value is None:
         return None
     text = str(value).strip()
-    if not text or text.lower() in ("none", "-", "null"):
+    if not text or text.lower() in {"none", "-", "null"}:
         return None
     return text
 
@@ -172,9 +172,9 @@ def _parse_bool_arg(args: dict, name: str, *, default: bool = False):
     if isinstance(value, bool):
         return value, None
     text = str(value).strip().lower()
-    if text in ("true", "1", "yes"):
+    if text in {"true", "1", "yes"}:
         return True, None
-    if text in ("false", "0", "no"):
+    if text in {"false", "0", "no"}:
         return False, None
     return default, f"{name} must be a boolean or 'true'/'false'"
 
@@ -406,12 +406,21 @@ def _handle_complete(args: dict, **kw) -> str:
                 # Structured rejection — surface the phantom ids so the
                 # worker can retry with a corrected list or drop the
                 # field. Audit event already landed in the DB.
+                #
+                # The task itself was NOT mutated (the gate runs before
+                # the write txn), so the worker can simply call
+                # kanban_complete again. Spell that out — without it the
+                # model often interprets a tool_error as a terminal
+                # failure and either blocks or crashes the run instead
+                # of retrying. See #22923.
                 return tool_error(
                     f"kanban_complete blocked: the following created_cards "
                     f"do not exist or were not created by this worker: "
                     f"{', '.join(hall_err.phantom)}. "
-                    f"Either omit them, use only ids returned from successful "
-                    f"kanban_create calls, or remove the created_cards field."
+                    f"Your task is still in-flight (no state change). "
+                    f"Retry kanban_complete with the same summary/metadata "
+                    f"and either drop these ids from created_cards, or pass "
+                    f"created_cards=[] to skip the card-claim check entirely."
                 )
             if not ok:
                 return tool_error(
