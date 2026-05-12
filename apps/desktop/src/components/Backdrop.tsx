@@ -144,7 +144,7 @@ export function Backdrop() {
   const noise = useControls(
     'Backdrop / Noise',
     {
-      enabled: { value: true, label: 'on' },
+      enabled: { value: false, label: 'on' },
       opacity: { value: 0.21, min: 0, max: 1.5, step: 0.01, label: 'opacity (× mul)' },
       blendMode: { value: 'color-dodge' as BlendMode, options: BLEND_MODES, label: 'blend' },
       color: { value: '#eaeaea', label: 'dot color' },
