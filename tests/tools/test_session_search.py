@@ -766,6 +766,12 @@ class TestSessionSearch:
         Regression test for #15909: when a delegation child session (source='telegram')
         resolves to a parent (source='api_server'), the result entry must report
         'api_server', not 'telegram'.
+
+        Note: as of the match_message_id pairing fix, the result's ``session_id``
+        is now the raw FTS5 sid (the only sid that pairs with match_message_id),
+        and the lineage root is exposed as ``parent_session_id``. The ``source``
+        promotion still comes from the resolved parent — that part of #15909 is
+        unchanged.
         """
         from unittest.mock import MagicMock, AsyncMock, patch as _patch
         from tools.session_search_tool import session_search
@@ -775,6 +781,7 @@ class TestSessionSearch:
         mock_db.search_messages.return_value = [
             {
                 "session_id": "child_sid",
+                "id": 42,
                 "content": "hello world",
                 "source": "telegram",       # child session source — wrong value to surface
                 "session_started": 1709400000,
@@ -812,14 +819,95 @@ class TestSessionSearch:
             new_callable=AsyncMock,
             side_effect=RuntimeError("no provider"),
         ):
-            result = json.loads(session_search(query="hello world", db=mock_db))
+            # Use mode='fast' to exercise the per-result (session_id,
+            # match_message_id) pair shape. Summary mode doesn't return
+            # match_message_id so the regression vector is fast-only.
+            result = json.loads(session_search(query="hello world", db=mock_db, mode="fast"))
 
         assert result["success"] is True
         assert result["count"] == 1
         entry = result["results"][0]
-        assert entry["session_id"] == "parent_sid", "should report resolved parent session ID"
+        # Raw FTS5 sid is preserved (this is the sid that pairs with match_message_id).
+        assert entry["session_id"] == "child_sid", (
+            "session_id should be the raw FTS5 row's sid so it pairs with match_message_id"
+        )
+        # Lineage root is exposed separately.
+        assert entry["parent_session_id"] == "parent_sid", (
+            "parent_session_id should expose the resolved lineage root"
+        )
+        # match_message_id is the row's id (which lives in child_sid, not parent_sid).
+        assert entry["match_message_id"] == 42
+        # #15909 invariant: source still promotes from the resolved parent.
         assert entry["source"] == "api_server", (
             f"source should be parent's 'api_server', got {entry['source']!r}"
+        )
+
+    def test_fast_pair_session_id_with_match_message_id(self):
+        """fast mode must emit (session_id, match_message_id) as a self-consistent pair.
+
+        Before this fix the result reused the lineage root as session_id but
+        kept the FTS5 row's id as match_message_id. The pair was unusable for
+        guided drill-down because the message lives in a child session, not
+        the parent. This test pins the contract: session_id is the raw sid of
+        the row that contains match_message_id; parent_session_id is exposed
+        separately when there's a lineage above it.
+        """
+        from unittest.mock import MagicMock, AsyncMock, patch as _patch
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {
+                "session_id": "child_sid",
+                "id": 4242,
+                "content": "...query match...",
+                "source": "tui",
+                "session_started": 1709400000,
+                "model": "test",
+            },
+        ]
+
+        def _get_session(sid):
+            if sid == "child_sid":
+                return {"id": "child_sid", "parent_session_id": "root_sid",
+                        "source": "tui", "started_at": 1709400000}
+            if sid == "root_sid":
+                return {"id": "root_sid", "parent_session_id": None,
+                        "source": "tui", "started_at": 1709300000}
+            return None
+
+        mock_db.get_session.side_effect = _get_session
+
+        result = json.loads(session_search(query="query match", db=mock_db, mode="fast"))
+        entry = result["results"][0]
+
+        # The pair the agent will hand back to mode='guided' must be valid.
+        assert entry["session_id"] == "child_sid"
+        assert entry["match_message_id"] == 4242
+        # And the user-facing lineage is still discoverable.
+        assert entry["parent_session_id"] == "root_sid"
+
+    def test_fast_no_parent_session_id_field_when_session_is_already_root(self):
+        """When the matching session has no parent, parent_session_id is omitted (tidy output)."""
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {"session_id": "root_only", "id": 7, "content": "hit",
+             "source": "cli", "session_started": 1709400000, "model": "test"},
+        ]
+        mock_db.get_session.return_value = {
+            "id": "root_only", "parent_session_id": None, "source": "cli",
+            "started_at": 1709400000,
+        }
+
+        result = json.loads(session_search(query="hit", db=mock_db, mode="fast"))
+        entry = result["results"][0]
+        assert entry["session_id"] == "root_only"
+        assert entry["match_message_id"] == 7
+        assert "parent_session_id" not in entry, (
+            "parent_session_id should be absent when session has no lineage above it"
         )
 
 
@@ -993,6 +1081,8 @@ class TestGuidedMode:
 
         db = self._make_db()
         db.get_messages_around.return_value = []  # anchor not in session
+        # Make sure the rebind safety net finds no owning session either.
+        db.get_session_id_for_message = lambda mid: None
 
         result = json.loads(session_search(
             query="",
@@ -1004,6 +1094,104 @@ class TestGuidedMode:
 
         assert result["success"] is False
         assert "around_message_id" in result["error"].lower()
+
+    def test_guided_rebinds_anchor_when_message_lives_in_descendant_session(self):
+        """Safety net: if (parent_sid, child_message_id) is passed (the broken
+        shape that fast emitted before the pairing fix, and that may still
+        appear from memory / legacy callers), guided locates the descendant
+        session that actually owns the message and rebinds transparently.
+        Rebind only happens within the same lineage; cross-lineage stays an
+        error.
+        """
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        db = MagicMock()
+
+        # Lineage: parent_sid is root; child_sid is a delegation/compression child.
+        def _get_session(sid):
+            if sid == "parent_sid":
+                return {"id": "parent_sid", "parent_session_id": None,
+                        "source": "tui", "started_at": 1709400000, "title": "parent"}
+            if sid == "child_sid":
+                return {"id": "child_sid", "parent_session_id": "parent_sid",
+                        "source": "tui", "started_at": 1709500000, "title": "child"}
+            return None
+        db.get_session.side_effect = _get_session
+
+        # Message 4242 lives in child_sid, not parent_sid.
+        def _get_messages_around(sid, mid, window):
+            if sid == "child_sid" and mid == 4242:
+                return [
+                    {"id": 4240, "role": "user", "content": "before-2"},
+                    {"id": 4241, "role": "assistant", "content": "before-1"},
+                    {"id": 4242, "role": "tool", "content": "ANCHOR"},
+                    {"id": 4243, "role": "assistant", "content": "after-1"},
+                    {"id": 4244, "role": "user", "content": "after-2"},
+                ]
+            return []
+        db.get_messages_around.side_effect = _get_messages_around
+
+        # Safety-net lookup: which session owns message 4242? child_sid.
+        db.get_session_id_for_message = lambda mid: "child_sid" if mid == 4242 else None
+
+        # Agent passes the BROKEN pair (parent sid, child message id) — should rebind.
+        result = json.loads(session_search(
+            query="",
+            db=db,
+            mode="guided",
+            session_id="parent_sid",
+            around_message_id=4242,
+        ))
+
+        assert result["success"] is True, result
+        windows = result["windows"]
+        assert len(windows) == 1
+        w = windows[0]
+        assert w["success"] is True
+        assert w["session_id"] == "child_sid", "should rebind to the owning session"
+        assert w["around_message_id"] == 4242
+        assert "warning" in w, "rebind must be surfaced via a warning field"
+        assert "rebound" in w["warning"].lower()
+        # Anchor flag is set on the right row.
+        anchor = next(m for m in w["messages"] if m.get("anchor"))
+        assert anchor["id"] == 4242
+
+    def test_guided_does_not_rebind_across_lineages(self):
+        """Cross-lineage rebind is rejected — only same-lineage descendants count.
+        Protects against silently drilling into an unrelated session if some
+        ID collision happens.
+        """
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        db = MagicMock()
+
+        def _get_session(sid):
+            if sid == "lineage_A":
+                return {"id": "lineage_A", "parent_session_id": None,
+                        "started_at": 1709400000}
+            if sid == "lineage_B":
+                return {"id": "lineage_B", "parent_session_id": None,
+                        "started_at": 1709500000}
+            return None
+        db.get_session.side_effect = _get_session
+
+        # Anchor 4242 is empty in A but owned by B (different lineage).
+        db.get_messages_around.return_value = []
+        db.get_session_id_for_message = lambda mid: "lineage_B" if mid == 4242 else None
+
+        result = json.loads(session_search(
+            query="",
+            db=db,
+            mode="guided",
+            session_id="lineage_A",
+            around_message_id=4242,
+        ))
+
+        # Single-anchor failure surfaces as top-level tool_error (legacy shape).
+        assert result["success"] is False
+        assert "not in session_id" in result["error"]
 
     def test_at_session_boundary_returns_partial_window(self):
         from tools.session_search_tool import session_search

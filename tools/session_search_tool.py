@@ -489,6 +489,64 @@ def _guided_drill_down(
                 "around_message_id": a_msg_id,
             })
             continue
+
+        # Safety net: the agent (or memory, or a legacy caller) may pair a
+        # parent/lineage-root session_id with a message_id that actually
+        # lives in a descendant (child) session. Before this commit, fast
+        # mode returned exactly that broken pair. We now emit the matching
+        # raw sid in fast mode, but guided should remain forgiving for
+        # callers that haven't updated yet.
+        #
+        # Recovery rule: locate the real owning session by message id; if
+        # that session is in the same lineage as ``a_sid``, transparently
+        # rebind and refetch. Record a warning so the rebind is visible.
+        rebind_warning = None
+        if not messages:
+            owning = None
+            # Prefer a helper if SessionDB exposes one (forward-compat).
+            try:
+                if hasattr(db, "get_session_id_for_message"):
+                    owning = db.get_session_id_for_message(a_msg_id)
+            except Exception as e:
+                logging.debug("get_session_id_for_message failed: %s", e, exc_info=True)
+                owning = None
+            # Fallback: query through SessionDB._conn (the canonical connection).
+            if not owning:
+                try:
+                    conn = getattr(db, "_conn", None)
+                    if conn is not None:
+                        row = conn.execute(
+                            "SELECT session_id FROM messages WHERE id = ?",
+                            (a_msg_id,),
+                        ).fetchone()
+                        # sqlite3.Row supports indexing; tuple fallback works too.
+                        owning = row[0] if row else None
+                except Exception as e:
+                    logging.debug("owning-session lookup failed: %s", e, exc_info=True)
+                    owning = None
+
+            if owning and owning != a_sid:
+                # Check same lineage (walk both up to roots).
+                a_root = _resolve_to_parent(a_sid)
+                o_root = _resolve_to_parent(owning)
+                if a_root and o_root and a_root == o_root:
+                    try:
+                        messages = db.get_messages_around(owning, a_msg_id, window=window)
+                    except Exception as e:
+                        logging.debug("rebind get_messages_around failed: %s", e, exc_info=True)
+                        messages = []
+                    if messages:
+                        rebind_warning = (
+                            f"around_message_id {a_msg_id} lives in {owning} "
+                            f"(child of {a_sid}); rebound transparently"
+                        )
+                        # Re-fetch session_meta for the actual owning session.
+                        try:
+                            session_meta = db.get_session(owning) or session_meta
+                        except Exception:
+                            pass
+                        a_sid = owning
+
         if not messages:
             windows_out.append({
                 "success": False,
@@ -524,7 +582,7 @@ def _guided_drill_down(
             entry = {k: v for k, v in entry.items() if v is not None or k in ("content",)}
             out_messages.append(entry)
 
-        windows_out.append({
+        success_entry = {
             "success": True,
             "session_id": a_sid,
             "around_message_id": a_msg_id,
@@ -537,7 +595,10 @@ def _guided_drill_down(
             "messages": out_messages,
             "messages_before": messages_before,
             "messages_after": messages_after,
-        })
+        }
+        if rebind_warning:
+            success_entry["warning"] = rebind_warning
+        windows_out.append(success_entry)
 
     # 5. Top-level response shape. ``windows`` is always a list. For
     #    single-anchor calls (the common case), we mirror the legacy fields
@@ -561,6 +622,8 @@ def _guided_drill_down(
                 "messages_before": only["messages_before"],
                 "messages_after": only["messages_after"],
             })
+            if only.get("warning"):
+                response["warning"] = only["warning"]
         else:
             # Single-anchor failure: surface as a top-level tool_error so
             # callers don't have to dig into the windows array for the
@@ -705,6 +768,16 @@ def session_search(
         # Group by resolved (parent) session_id, dedup, skip the current
         # session lineage. Compression and delegation create child sessions
         # that still belong to the same active conversation.
+        #
+        # IMPORTANT: we group BY parent (so the user sees one entry per
+        # conversation lineage), but we preserve the raw FTS5 session_id on
+        # the surviving result. The raw sid is the only sid that pairs
+        # validly with ``match_message_id``; rewriting it to the parent
+        # produces a "{parent_sid, child_message_id}" handle that guided
+        # mode cannot resolve (#regression introduced by the original
+        # match_message_id rollout). See the parent_session_id field in
+        # fast-mode output for the lineage-root link the user expects to
+        # see.
         seen_sessions = {}
         for result in raw_results:
             raw_sid = result["session_id"]
@@ -717,24 +790,36 @@ def session_search(
                 continue
             if resolved_sid not in seen_sessions:
                 result = dict(result)
-                result["session_id"] = resolved_sid
+                # Keep raw_sid as session_id; expose lineage root separately.
+                result["session_id"] = raw_sid
+                if resolved_sid and resolved_sid != raw_sid:
+                    result["parent_session_id"] = resolved_sid
                 seen_sessions[resolved_sid] = result
             if len(seen_sessions) >= limit:
                 break
 
         if mode == "fast":
             results = []
-            for session_id, match_info in seen_sessions.items():
+            for lineage_root, match_info in seen_sessions.items():
+                # ``lineage_root`` is the dict key (resolved parent — used for
+                # dedup grouping). ``match_info["session_id"]`` is the raw FTS5
+                # row's session — the only sid that pairs with
+                # ``match_info["id"]`` (the message id). Emit the pair (raw sid +
+                # match_message_id) so the agent's follow-up
+                # mode='guided' call has a valid {session_id, around_message_id}
+                # handle. ``parent_session_id`` (if different) tells the agent
+                # which conversation lineage this fragment belongs to.
+                hit_sid = match_info.get("session_id") or lineage_root
                 try:
-                    session_meta = db.get_session(session_id) or {}
+                    session_meta = db.get_session(lineage_root) or {}
                 except Exception:
                     session_meta = {}
                 snippet = match_info.get("snippet") or ""
                 context = match_info.get("context") or []
                 if not isinstance(context, list):
                     context = []
-                results.append({
-                    "session_id": session_id,
+                entry = {
+                    "session_id": hit_sid,
                     "when": _format_timestamp(
                         session_meta.get("started_at") or match_info.get("session_started")
                     ),
@@ -746,7 +831,14 @@ def session_search(
                     "snippet": snippet,
                     "context": context,
                     "summary": "[Search hit — summary not generated in fast mode] Use snippet/context fields, or set mode='summary' for LLM-generated recall.",
-                })
+                }
+                # Only emit parent_session_id when the FTS5 row lives in a
+                # child of the displayed lineage — keeps the common case
+                # (no delegation/compression) tidy.
+                parent_sid = match_info.get("parent_session_id")
+                if parent_sid and parent_sid != hit_sid:
+                    entry["parent_session_id"] = parent_sid
+                results.append(entry)
 
             return json.dumps({
                 "success": True,
@@ -883,8 +975,11 @@ SESSION_SEARCH_SCHEMA = {
         "discover which sessions touched a topic.\n"
         "3. Drill-down (mode='guided'): When a fast-mode result looks promising but you need the "
         "actual conversation around it, call again with mode='guided', session_id from the result, "
-        "and around_message_id=match_message_id from the same result. Returns a window of messages "
-        "around the anchor (no LLM, no truncation, ~ms latency).\n\n"
+        "and around_message_id=match_message_id from the same result. The pair (session_id, "
+        "match_message_id) is always self-consistent — pass them as-is, do NOT substitute "
+        "parent_session_id (which is shown for display context only and won't pair with the "
+        "match_message_id). Returns a window of messages around the anchor (no LLM, no truncation, "
+        "~ms latency).\n\n"
         "RECOMMENDED FLOWS:\n"
         "- 'what did we decide about X?' → mode='summary' (synthesised recall)\n"
         "- 'find the latest session about Y' → mode='fast' (cheap discovery)\n"
