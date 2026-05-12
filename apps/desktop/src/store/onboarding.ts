@@ -2,15 +2,17 @@ import { atom } from 'nanostores'
 
 import {
   cancelOAuthSession,
+  getGlobalModelOptions,
   listOAuthProviders,
   pollOAuthSession,
   setEnvVar,
+  setModelAssignment,
   startOAuthLogin,
   submitOAuthCode
 } from '@/hermes'
 import { evaluateRuntimeReadiness, type RuntimeReadinessResult } from '@/lib/runtime-readiness'
 import { notify, notifyError } from '@/store/notifications'
-import type { OAuthProvider, OAuthStartResponse } from '@/types/hermes'
+import type { ModelOptionProvider, OAuthProvider, OAuthStartResponse } from '@/types/hermes'
 
 type PkceStart = Extract<OAuthStartResponse, { flow: 'pkce' }>
 type DeviceStart = Extract<OAuthStartResponse, { flow: 'device_code' }>
@@ -25,6 +27,20 @@ export type OnboardingFlow =
   | { provider: OAuthProvider; start: OAuthStartResponse; status: 'submitting' }
   | { copied: boolean; provider: OAuthProvider; status: 'external_pending' }
   | { provider: OAuthProvider; status: 'success' }
+  | {
+      // After successful credential acquisition, before completing
+      // onboarding: show the user which model they're getting and let
+      // them change it. providerSlug is the model.options slug for the
+      // just-authenticated provider (used to persist the chosen model
+      // via /api/model/set). The change-model UI uses the existing
+      // ModelPickerDialog, which fetches its own model list from
+      // /api/model/options — no need to cache the list here.
+      currentModel: string
+      label: string
+      providerSlug: string
+      saving: boolean
+      status: 'confirming_model'
+    }
   | { message: string; provider?: OAuthProvider; start?: OAuthStartResponse; status: 'error' }
 
 export interface DesktopOnboardingState {
@@ -118,17 +134,109 @@ function notifyReady(provider: string) {
   notify({ kind: 'success', title: 'Hermes is ready', message: `${provider} connected.` })
 }
 
-async function reloadAndConnect(ctx: OnboardingContext, providerName: string, onFail: (reason: null | string) => void) {
+// After credentials are persisted, ask the backend which provider+models
+// are now authenticated. Pick the first curated model for the matching
+// provider as a sensible default, persist it via /api/model/set, and
+// transition to the model-confirmation step. If anything goes wrong
+// fetching options (no providers returned, network error), the caller
+// falls through to completing onboarding without showing the confirm
+// card — the user gets the undefined-model auto-selection behaviour
+// we had before, which works but is surprising. The confirm step is
+// opportunistic polish, not a hard requirement for onboarding.
+async function fetchProviderDefaultModel(
+  preferredSlugs: string[]
+): Promise<null | { providerSlug: string; defaultModel: string }> {
+  let options
+
+  try {
+    options = await getGlobalModelOptions()
+  } catch {
+    return null
+  }
+
+  const providers = options?.providers ?? []
+
+  if (providers.length === 0) {
+    return null
+  }
+
+  // Try each preferred slug (lowercased), fall back to the first provider
+  // returned (model.options orders by recency / authenticated state, so
+  // the just-authenticated provider is usually first anyway).
+  const lower = preferredSlugs.map(s => s.toLowerCase())
+  const matched = providers.find((p: ModelOptionProvider) => lower.includes(String(p.slug).toLowerCase())) ?? providers[0]
+
+  const models = matched.models ?? []
+
+  if (models.length === 0) {
+    return null
+  }
+
+  return {
+    providerSlug: String(matched.slug),
+    defaultModel: String(models[0])
+  }
+}
+
+// After OAuth/API-key success: reload the backend env, verify runtime,
+// then either show the model-confirm step or fall straight through to
+// completion if we can't determine a default.
+//
+// onFail receives the runtime-readiness `reason` from checkRuntime so
+// the caller can fold it into a user-facing error — same contract as
+// reloadAndConnect used to have (which this replaces).
+async function completeWithModelConfirm(
+  ctx: OnboardingContext,
+  providerLabel: string,
+  preferredSlugs: string[],
+  onFail: (reason: null | string) => void
+) {
   await ctx.requestGateway('reload.env').catch(() => undefined)
   const runtime = await checkRuntime(ctx)
 
-  if (runtime.ready) {
-    notifyReady(providerName)
+  if (!runtime.ready) {
+    onFail(runtime.reason)
+
+    return
+  }
+
+  const defaults = await fetchProviderDefaultModel(preferredSlugs)
+
+  if (!defaults) {
+    // Couldn't get a sensible default — proceed without confirm step.
+    notifyReady(providerLabel)
     completeDesktopOnboarding()
     ctx.onCompleted?.()
-  } else {
-    onFail(runtime.reason)
+
+    return
   }
+
+  // Persist the default model BEFORE showing the confirm card so that:
+  // (1) "current default: X" shown in the UI is what's actually written
+  //     to config — no lying.
+  // (2) If the user clicks "Start chatting" without changing anything,
+  //     no extra write is needed.
+  // (3) If they bail out (e.g., refresh the page), they still end up
+  //     with a working config, not an empty-model fallback.
+  try {
+    await setModelAssignment({
+      scope: 'main',
+      provider: defaults.providerSlug,
+      model: defaults.defaultModel
+    })
+  } catch {
+    // Persistence failed — still show the confirm card so the user can
+    // pick something explicitly. The backend will pick its own default
+    // at chat time if we end up never persisting.
+  }
+
+  setFlow({
+    status: 'confirming_model',
+    providerSlug: defaults.providerSlug,
+    currentModel: defaults.defaultModel,
+    label: providerLabel,
+    saving: false
+  })
 }
 
 function providerResolutionFailure(reason: null | string) {
@@ -241,7 +349,7 @@ async function pollDevice(provider: OAuthProvider, start: DeviceStart, ctx: Onbo
     if (status === 'approved') {
       clearPoll()
       setFlow({ status: 'success', provider })
-      await reloadAndConnect(ctx, provider.name, reason =>
+      await completeWithModelConfirm(ctx, provider.name, [provider.id], reason =>
         setFlow({
           status: 'error',
           provider,
@@ -281,7 +389,7 @@ export async function submitOnboardingCode(ctx: OnboardingContext) {
 
     if (resp.ok && resp.status === 'approved') {
       setFlow({ status: 'success', provider })
-      await reloadAndConnect(ctx, provider.name, reason =>
+      await completeWithModelConfirm(ctx, provider.name, [provider.id], reason =>
         setFlow({
           status: 'error',
           provider,
@@ -360,7 +468,7 @@ export async function recheckExternalSignin(ctx: OnboardingContext) {
   }
 
   const { provider } = flow
-  await reloadAndConnect(ctx, provider.name, reason =>
+  await completeWithModelConfirm(ctx, provider.name, [provider.id], reason =>
     setFlow({
       status: 'error',
       provider,
@@ -382,7 +490,14 @@ export async function saveOnboardingApiKey(envKey: string, value: string, label:
     await setEnvVar(envKey, trimmed)
     let stillFailing = false
     let runtimeFailure: null | string = null
-    await reloadAndConnect(ctx, label, reason => {
+    // For API-key flows we don't have a definitive provider id (the
+    // user picked which API key they're entering, but the corresponding
+    // backend slug — e.g. OPENROUTER_API_KEY → "openrouter" — is the
+    // env-key prefix stripped). Pass a couple of likely candidates;
+    // fetchProviderDefaultModel falls back to the first authenticated
+    // provider returned by /api/model/options if none match.
+    const slugCandidates = [envKey.replace(/_API_KEY$/, '').toLowerCase(), label.toLowerCase()]
+    await completeWithModelConfirm(ctx, label, slugCandidates, reason => {
       stillFailing = true
       runtimeFailure = reason
     })
@@ -402,4 +517,54 @@ export async function saveOnboardingApiKey(envKey: string, value: string, label:
 
     return { ok: false, message: errMessage(error) }
   }
+}
+
+// User picked a different model from the dropdown on the confirm card.
+// Persists immediately so the displayed value is always what's on disk.
+export async function setOnboardingModel(model: string) {
+  const { flow } = $desktopOnboarding.get()
+
+  if (flow.status !== 'confirming_model') {
+    return
+  }
+
+  // Optimistic update so the dropdown feels instant; revert on failure.
+  const previous = flow.currentModel
+  setFlow({ ...flow, currentModel: model, saving: true })
+
+  try {
+    await setModelAssignment({
+      scope: 'main',
+      provider: flow.providerSlug,
+      model
+    })
+    const current = $desktopOnboarding.get().flow
+
+    if (current.status === 'confirming_model') {
+      setFlow({ ...current, currentModel: model, saving: false })
+    }
+  } catch (error) {
+    notifyError(error, 'Could not change model')
+    const current = $desktopOnboarding.get().flow
+
+    if (current.status === 'confirming_model') {
+      setFlow({ ...current, currentModel: previous, saving: false })
+    }
+  }
+}
+
+// User clicked "Start chatting" on the confirm card. Finalizes onboarding
+// — the model was already persisted by completeWithModelConfirm (or by
+// setOnboardingModel if they changed it), so all that's left is to mark
+// onboarding done and unblock the rest of the app.
+export function confirmOnboardingModel(ctx: OnboardingContext) {
+  const { flow } = $desktopOnboarding.get()
+
+  if (flow.status !== 'confirming_model') {
+    return
+  }
+
+  notifyReady(flow.label)
+  completeDesktopOnboarding()
+  ctx.onCompleted?.()
 }

@@ -1,6 +1,7 @@
 import { useStore } from '@nanostores/react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 
+import { ModelPickerDialog } from '@/components/model-picker'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Check, ChevronLeft, ChevronRight, ExternalLink, KeyRound, Loader2, Sparkles } from '@/lib/icons'
@@ -9,6 +10,7 @@ import { $desktopBoot, type DesktopBootState } from '@/store/boot'
 import {
   $desktopOnboarding,
   cancelOnboardingFlow,
+  confirmOnboardingModel,
   copyDeviceCode,
   copyExternalCommand,
   type OnboardingContext,
@@ -18,6 +20,7 @@ import {
   saveOnboardingApiKey,
   setOnboardingCode,
   setOnboardingMode,
+  setOnboardingModel,
   startProviderOAuth,
   submitOnboardingCode
 } from '@/store/onboarding'
@@ -394,9 +397,13 @@ function FlowPanel({ ctx, flow }: { ctx: OnboardingContext; flow: OnboardingFlow
     return (
       <div className="flex items-center gap-2 rounded-2xl border border-primary/30 bg-primary/10 px-4 py-3 text-sm text-primary">
         <Check className="size-4" />
-        {title} connected. You're ready to chat.
+        {title} connected. Picking a default model...
       </div>
     )
+  }
+
+  if (flow.status === 'confirming_model') {
+    return <ConfirmingModelPanel ctx={ctx} flow={flow} />
   }
 
   if (flow.status === 'error') {
@@ -523,6 +530,69 @@ function CancelBtn({ size = 'default' }: { size?: 'default' | 'sm' }) {
     <Button onClick={cancelOnboardingFlow} size={size} variant="ghost">
       Cancel
     </Button>
+  )
+}
+
+function ConfirmingModelPanel({
+  ctx,
+  flow
+}: {
+  ctx: OnboardingContext
+  flow: Extract<OnboardingFlow, { status: 'confirming_model' }>
+}) {
+  // Local state controls whether the model picker dialog is open.
+  // We reuse the existing ModelPickerDialog component (the same picker
+  // available from the chat shell) rather than building an inline
+  // dropdown — gives us search, multi-provider listing if relevant, and
+  // a familiar UI for users who'll see this picker again later.
+  const [pickerOpen, setPickerOpen] = useState(false)
+
+  return (
+    <div className="grid gap-4">
+      <div className="flex items-center gap-2 rounded-2xl border border-primary/30 bg-primary/10 px-4 py-3 text-sm text-primary">
+        <Check className="size-4 shrink-0" />
+        <span>{flow.label} connected.</span>
+      </div>
+
+      <div className="grid gap-3 rounded-2xl border border-border bg-background/60 p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="min-w-0">
+            <p className="text-xs uppercase tracking-wide text-muted-foreground">Default model</p>
+            <p className="mt-1 truncate font-mono text-sm">{flow.currentModel}</p>
+          </div>
+          <Button disabled={flow.saving} onClick={() => setPickerOpen(true)} size="sm" variant="outline">
+            Change
+          </Button>
+        </div>
+      </div>
+
+      <div className="flex justify-end">
+        <Button disabled={flow.saving} onClick={() => confirmOnboardingModel(ctx)}>
+          {flow.saving ? <Loader2 className="size-4 animate-spin" /> : <Sparkles className="size-4" />}
+          Start chatting
+        </Button>
+      </div>
+
+      {/*
+        ModelPickerDialog defaults to z-130 on its content, which renders
+        UNDER the onboarding overlay (z-1300) and breaks pointer events.
+        Bump it above with z-[1310] so the picker sits on top of the
+        onboarding panel. The dialog's own dim-backdrop layer stays at
+        its default z-120 — the onboarding overlay is already dimming
+        the rest of the screen, so we don't want a second backdrop.
+      */}
+      <ModelPickerDialog
+        contentClassName="z-[1310]"
+        currentModel={flow.currentModel}
+        currentProvider={flow.providerSlug}
+        onOpenChange={setPickerOpen}
+        onSelect={({ model }) => {
+          void setOnboardingModel(model)
+          setPickerOpen(false)
+        }}
+        open={pickerOpen}
+      />
+    </div>
   )
 }
 

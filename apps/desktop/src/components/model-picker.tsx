@@ -22,6 +22,13 @@ interface ModelPickerDialogProps {
   currentModel: string
   currentProvider: string
   onSelect: (selection: { provider: string; model: string; persistGlobal: boolean }) => void
+  /**
+   * Optional class to apply to DialogContent. Use to override z-index when
+   * stacking the picker on top of another fixed overlay (e.g. the desktop
+   * onboarding overlay, which sits at z-1300; the default Dialog z-130 ends
+   * up rendering underneath and blocks pointer events).
+   */
+  contentClassName?: string
 }
 
 export function ModelPickerDialog({
@@ -31,7 +38,8 @@ export function ModelPickerDialog({
   sessionId,
   currentModel,
   currentProvider,
-  onSelect
+  onSelect,
+  contentClassName
 }: ModelPickerDialogProps) {
   const [persistGlobal, setPersistGlobal] = useState(!sessionId)
 
@@ -71,7 +79,7 @@ export function ModelPickerDialog({
 
   return (
     <Dialog onOpenChange={onOpenChange} open={open}>
-      <DialogContent className="max-h-[85vh] max-w-2xl gap-0 overflow-hidden p-0">
+      <DialogContent className={cn('max-h-[85vh] max-w-2xl gap-0 overflow-hidden p-0', contentClassName)}>
         <DialogHeader className="border-b border-border px-4 py-3">
           <DialogTitle>Switch model</DialogTitle>
           <DialogDescription className="font-mono text-xs leading-relaxed">
