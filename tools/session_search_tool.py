@@ -529,7 +529,7 @@ def session_search(
             limit = int(limit)
         except (TypeError, ValueError):
             limit = 3
-    limit = max(1, min(limit, 5))  # Clamp to [1, 5]
+    limit = max(1, min(limit, 10))  # Clamp to [1, 10]
 
     # Recent sessions mode: when query is empty, return metadata for recent sessions.
     # No LLM calls — just DB queries for titles, previews, timestamps.
@@ -810,7 +810,7 @@ SESSION_SEARCH_SCHEMA = {
             },
             "limit": {
                 "type": "integer",
-                "description": "Max sessions to return (default: 3, max: 5). Ignored when mode='guided' (which returns one anchored window).",
+                "description": "Max sessions to return (default: 3, max: 10). Bump higher (5–10) when the user wants to be in the retrieval loop and pick the right anchor for a guided drill-down. Ignored when mode='guided' (which returns one anchored window per anchor).",
                 "default": 3,
             },
             "mode": {
