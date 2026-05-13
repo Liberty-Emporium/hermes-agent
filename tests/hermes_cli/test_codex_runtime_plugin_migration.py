@@ -239,12 +239,130 @@ class TestStripExistingManagedBlock:
 # ---- end-to-end migrate() ----
 
 class TestMigrate:
-    def test_no_servers_writes_placeholder(self, tmp_path):
-        report = migrate({}, codex_home=tmp_path)
+    def test_no_servers_no_plugins_no_perms_writes_placeholder(self, tmp_path):
+        report = migrate({}, codex_home=tmp_path,
+                         discover_plugins=False,
+                         default_permission_profile=None)
         assert report.written
         text = (tmp_path / "config.toml").read_text()
         assert MIGRATION_MARKER in text
-        assert "no MCP servers" in text
+        assert "no MCP servers" in text or "no MCP servers, plugins, or permissions" in text
+
+    def test_no_servers_still_writes_permissions_default(self, tmp_path):
+        """Even with zero MCP servers, enabling the runtime should write the
+        default permissions profile so users don't get prompted on every
+        write attempt. This is the fix for quirk #2."""
+        report = migrate({}, codex_home=tmp_path, discover_plugins=False)
+        assert report.written
+        text = (tmp_path / "config.toml").read_text()
+        assert "[permissions]" in text
+        assert 'default = "workspace-write"' in text
+        assert report.wrote_permissions_default == "workspace-write"
+
+    def test_explicit_none_permissions_skips_block(self, tmp_path):
+        report = migrate({"mcp_servers": {"x": {"command": "y"}}},
+                         codex_home=tmp_path,
+                         discover_plugins=False,
+                         default_permission_profile=None)
+        text = (tmp_path / "config.toml").read_text()
+        assert "[permissions]" not in text
+        assert report.wrote_permissions_default is None
+
+    def test_plugin_discovery_writes_plugin_blocks(self, tmp_path, monkeypatch):
+        """Discovered curated plugins land as [plugins."<name>@<marketplace>"]
+        blocks. This is what OpenClaw calls 'migrate native codex plugins.'"""
+        from hermes_cli import codex_runtime_plugin_migration as crpm
+
+        def fake_query(codex_home=None, timeout=8.0):
+            return [
+                {"name": "google-calendar", "marketplace": "openai-curated",
+                 "enabled": True},
+                {"name": "github", "marketplace": "openai-curated",
+                 "enabled": True},
+            ], None
+        monkeypatch.setattr(crpm, "_query_codex_plugins", fake_query)
+
+        report = migrate({}, codex_home=tmp_path, discover_plugins=True)
+        text = (tmp_path / "config.toml").read_text()
+        assert '[plugins."github@openai-curated"]' in text
+        assert '[plugins."google-calendar@openai-curated"]' in text
+        assert "enabled = true" in text
+        assert "google-calendar@openai-curated" in report.migrated_plugins
+        assert "github@openai-curated" in report.migrated_plugins
+
+    def test_plugin_discovery_failure_non_fatal(self, tmp_path, monkeypatch):
+        """If codex isn't installed or RPC fails, MCP migration still
+        completes. The error surfaces in the report but doesn't abort."""
+        from hermes_cli import codex_runtime_plugin_migration as crpm
+
+        def fake_query_fails(codex_home=None, timeout=8.0):
+            return [], "codex CLI not available"
+        monkeypatch.setattr(crpm, "_query_codex_plugins", fake_query_fails)
+
+        report = migrate({"mcp_servers": {"x": {"command": "y"}}},
+                         codex_home=tmp_path, discover_plugins=True)
+        assert report.written
+        assert report.migrated == ["x"]
+        assert report.plugin_query_error == "codex CLI not available"
+        assert report.migrated_plugins == []
+
+    def test_discover_plugins_false_skips_query(self, tmp_path, monkeypatch):
+        """Tests and restricted environments can opt out of the subprocess
+        spawn entirely."""
+        from hermes_cli import codex_runtime_plugin_migration as crpm
+
+        called = {"yes": False}
+        def boom(*a, **kw):
+            called["yes"] = True
+            return [], None
+        monkeypatch.setattr(crpm, "_query_codex_plugins", boom)
+
+        migrate({"mcp_servers": {"x": {"command": "y"}}},
+                codex_home=tmp_path, discover_plugins=False)
+        assert called["yes"] is False
+
+    def test_dry_run_skips_plugin_query(self, tmp_path, monkeypatch):
+        """Dry run should never spawn codex. Even with discover_plugins=True
+        the query is skipped because dry_run takes precedence."""
+        from hermes_cli import codex_runtime_plugin_migration as crpm
+
+        called = {"yes": False}
+        def boom(*a, **kw):
+            called["yes"] = True
+            return [], None
+        monkeypatch.setattr(crpm, "_query_codex_plugins", boom)
+
+        migrate({"mcp_servers": {"x": {"command": "y"}}},
+                codex_home=tmp_path, dry_run=True, discover_plugins=True)
+        assert called["yes"] is False
+
+    def test_re_run_replaces_plugin_block(self, tmp_path, monkeypatch):
+        """Plugin blocks are managed and re-runs should replace them
+        cleanly — same idempotency contract as MCP servers."""
+        from hermes_cli import codex_runtime_plugin_migration as crpm
+
+        # First run: only github
+        monkeypatch.setattr(crpm, "_query_codex_plugins",
+                            lambda codex_home=None, timeout=8.0: (
+                                [{"name": "github", "marketplace": "openai-curated", "enabled": True}],
+                                None,
+                            ))
+        migrate({}, codex_home=tmp_path, discover_plugins=True,
+                default_permission_profile=None)
+        first = (tmp_path / "config.toml").read_text()
+        assert "github@openai-curated" in first
+
+        # Second run: only canva (github went away)
+        monkeypatch.setattr(crpm, "_query_codex_plugins",
+                            lambda codex_home=None, timeout=8.0: (
+                                [{"name": "canva", "marketplace": "openai-curated", "enabled": True}],
+                                None,
+                            ))
+        migrate({}, codex_home=tmp_path, discover_plugins=True,
+                default_permission_profile=None)
+        second = (tmp_path / "config.toml").read_text()
+        assert "github@openai-curated" not in second
+        assert "canva@openai-curated" in second
 
     def test_dry_run_doesnt_write(self, tmp_path):
         report = migrate({"mcp_servers": {"x": {"command": "y"}}},

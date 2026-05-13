@@ -114,6 +114,12 @@ class CodexAppServerSession:
         self._client: Optional[CodexAppServerClient] = None
         self._thread_id: Optional[str] = None
         self._interrupt_event = threading.Event()
+        # Pending file-change items, keyed by item id. Populated on
+        # item/started for fileChange items; consumed by the approval
+        # bridge when codex sends item/fileChange/requestApproval. The
+        # approval params don't carry the changeset, so we cache here
+        # to surface a real summary in the approval prompt (quirk #4).
+        self._pending_file_changes: dict[str, str] = {}
         self._closed = False
 
     # ---------- lifecycle ----------
@@ -232,6 +238,22 @@ class CodexAppServerSession:
             # reading notifications, so the codex side isn't blocked.
             sreq = self._client.take_server_request(timeout=0)
             if sreq is not None:
+                # Drain any pending notifications first so per-turn state
+                # (e.g. _pending_file_changes for fileChange approvals) is
+                # up to date when we make the approval decision. Bounded
+                # to avoid starving the server-request response.
+                for _ in range(8):
+                    pending = self._client.take_notification(timeout=0)
+                    if pending is None:
+                        break
+                    self._track_pending_file_change(pending)
+                    proj = projector.project(pending)
+                    if proj.messages:
+                        result.projected_messages.extend(proj.messages)
+                    if proj.is_tool_iteration:
+                        result.tool_iterations += 1
+                    if proj.final_text is not None:
+                        result.final_text = proj.final_text
                 self._handle_server_request(sreq)
                 continue
 
@@ -247,6 +269,12 @@ class CodexAppServerSession:
                     self._on_event(note)
                 except Exception:  # pragma: no cover - display callback
                     logger.debug("on_event callback raised", exc_info=True)
+
+            # Track in-progress fileChange items so the approval bridge
+            # can surface a real change summary when codex requests
+            # approval (the approval params themselves don't carry the
+            # changeset). Quirk #4 fix.
+            self._track_pending_file_change(note)
 
             # Project into messages
             projection = projector.project(note)
@@ -341,11 +369,18 @@ class CodexAppServerSession:
         if self._routing.auto_approve_exec:
             return "accept"
         command = params.get("command") or ""
-        cwd = params.get("cwd") or ""
+        # Codex's CommandExecutionRequestApprovalParams has cwd as Optional —
+        # fall back to the session's cwd when codex doesn't include it so the
+        # approval prompt is never empty (quirk #10 fix).
+        cwd = params.get("cwd") or self._cwd or "<unknown>"
+        reason = params.get("reason")
+        description = f"Codex requests exec in {cwd}"
+        if reason:
+            description += f" — {reason}"
         if self._approval_callback is not None:
             try:
                 choice = self._approval_callback(
-                    command, f"Codex requests exec in {cwd}", allow_permanent=False
+                    command, description, allow_permanent=False
                 )
                 return _approval_choice_to_codex_decision(choice)
             except Exception:
@@ -357,18 +392,34 @@ class CodexAppServerSession:
         if self._routing.auto_approve_apply_patch:
             return "accept"
         if self._approval_callback is not None:
-            # Codex's FileChangeRequestApprovalParams only carries itemId/turnId/
-            # threadId/reason/grantRoot — NOT the changeset. (The changes array
-            # lives on the corresponding fileChange item, which we project on
-            # item/completed.) Display whatever context codex hands us.
-            reason = params.get("reason") or "apply file changes"
+            # FileChangeRequestApprovalParams gives us reason + grantRoot.
+            # The actual changeset lives on the corresponding fileChange
+            # item which the projector has already cached for us — look it
+            # up by item_id so the user sees what's actually changing.
+            reason = params.get("reason")
             grant_root = params.get("grantRoot")
-            description = f"Codex requests to apply a patch ({reason})"
+            item_id = params.get("itemId") or ""
+            change_summary = self._lookup_pending_file_change(item_id)
+            description_parts = []
+            if reason:
+                description_parts.append(reason)
+            if change_summary:
+                description_parts.append(change_summary)
             if grant_root:
-                description += f" — grants write to {grant_root}"
+                description_parts.append(f"grants write to {grant_root}")
+            description = (
+                "; ".join(description_parts)
+                if description_parts
+                else "Codex requests to apply a patch"
+            )
+            command_label = (
+                f"apply_patch: {change_summary}" if change_summary
+                else f"apply_patch: {reason}" if reason
+                else "apply_patch"
+            )
             try:
                 choice = self._approval_callback(
-                    f"apply_patch: {reason}",
+                    command_label,
                     description,
                     allow_permanent=False,
                 )
@@ -377,6 +428,55 @@ class CodexAppServerSession:
                 logger.exception("approval_callback raised on apply_patch")
                 return "decline"
         return "decline"
+
+    def _track_pending_file_change(self, note: dict) -> None:
+        """Maintain self._pending_file_changes from item/started + item/completed
+        notifications. Lets the apply_patch approval prompt show what's
+        actually changing — codex's approval params don't carry the data."""
+        method = note.get("method", "")
+        params = note.get("params") or {}
+        item = params.get("item") or {}
+        if item.get("type") != "fileChange":
+            return
+        item_id = item.get("id") or ""
+        if not item_id:
+            return
+        if method == "item/started":
+            changes = item.get("changes") or []
+            if not changes:
+                self._pending_file_changes[item_id] = "1 change pending"
+                return
+            kinds: dict[str, int] = {}
+            paths: list[str] = []
+            for ch in changes:
+                if not isinstance(ch, dict):
+                    continue
+                kind = (ch.get("kind") or {}).get("type") or "update"
+                kinds[kind] = kinds.get(kind, 0) + 1
+                p = ch.get("path") or ""
+                if p:
+                    paths.append(p)
+            counts = ", ".join(f"{n} {k}" for k, n in sorted(kinds.items()))
+            preview = ", ".join(paths[:3])
+            if len(paths) > 3:
+                preview += f", +{len(paths) - 3} more"
+            self._pending_file_changes[item_id] = (
+                f"{counts}: {preview}" if preview else counts
+            )
+        elif method == "item/completed":
+            self._pending_file_changes.pop(item_id, None)
+
+    def _lookup_pending_file_change(self, item_id: str) -> Optional[str]:
+        """Look up an in-progress fileChange item by id and summarize its
+        changes for the approval prompt. Returns None when we don't have
+        the item cached (e.g. approval arrived before item/started, or
+        fileChange item content not tracked yet)."""
+        if not item_id:
+            return None
+        cached = self._pending_file_changes.get(item_id)
+        if not cached:
+            return None
+        return cached
 
 
 def _approval_choice_to_codex_decision(choice: str) -> str:

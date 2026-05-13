@@ -1,26 +1,37 @@
-"""Migrate Hermes' MCP server config to the format Codex expects.
+"""Migrate Hermes' MCP server config and Codex's installed curated plugins
+to the format Codex expects in ~/.codex/config.toml.
 
 When the user enables the codex_app_server runtime, the codex subprocess
-runs its own MCP client (not Hermes'). For that to be useful, the user's
-MCP servers configured in ~/.hermes/config.yaml need to be visible to
-codex too. This module reads Hermes' YAML and writes the equivalent
-~/.codex/config.toml entries.
+runs its own MCP client and its own plugin runtime (Linear, Atlassian,
+Asana, plus per-account ChatGPT apps via app/list). For both of those to
+be useful, the user's choices need to be visible to codex too. This
+module:
 
-What translates:
-  Hermes mcp_servers.<name>.command/args/env  → codex stdio transport
-  Hermes mcp_servers.<name>.url/headers       → codex streamable_http transport
-  Hermes mcp_servers.<name>.timeout           → codex tool_timeout_sec
-  Hermes mcp_servers.<name>.connect_timeout   → codex startup_timeout_sec
+  1. Reads Hermes' YAML and writes equivalent [mcp_servers.<name>]
+     entries to ~/.codex/config.toml.
+  2. Queries codex's `plugin/list` for the openai-curated marketplace
+     and writes [plugins."<name>@<marketplace>"] entries for any plugin
+     the user has installed=true on their codex CLI. (This is what
+     OpenClaw calls "migrate native codex plugins" — the YouTube-video-
+     worthy bit Pash highlighted: Canva, GitHub, Calendar, Gmail
+     pre-configured.)
+  3. Writes a [permissions] default profile so users on this runtime
+     don't get an approval prompt on every write attempt.
+
+What translates (MCP servers):
+  Hermes mcp_servers.<n>.command/args/env  → codex stdio transport
+  Hermes mcp_servers.<n>.url/headers       → codex streamable_http transport
+  Hermes mcp_servers.<n>.timeout           → codex tool_timeout_sec
+  Hermes mcp_servers.<n>.connect_timeout   → codex startup_timeout_sec
 
 What does NOT translate (warned + skipped):
   Hermes-specific keys (sampling, etc.) — codex's MCP client has no
-  equivalent. Dropped with a per-server warning in the migration report.
+  equivalent. Listed in the per-server skipped[] field of the report.
 
-What this is NOT:
-  This is one-way config translation, not bidirectional sync. If the user
-  edits ~/.codex/config.toml afterwards (e.g. adds codex-only servers),
-  re-running migration replaces the migrated section but preserves
-  unrelated codex config (model, providers, sandbox profiles, etc.).
+What's NOT migrated (intentional):
+  AGENTS.md — codex respects this file natively in its cwd. Hermes' own
+  AGENTS.md (project-level) is already in the worktree, so codex picks
+  it up without translation. No code needed.
 """
 
 from __future__ import annotations
@@ -47,6 +58,9 @@ class MigrationReport:
     target_path: Optional[Path] = None
     migrated: list[str] = field(default_factory=list)
     skipped_keys_per_server: dict[str, list[str]] = field(default_factory=dict)
+    migrated_plugins: list[str] = field(default_factory=list)
+    plugin_query_error: Optional[str] = None
+    wrote_permissions_default: Optional[str] = None
     errors: list[str] = field(default_factory=list)
     written: bool = False
     dry_run: bool = False
@@ -67,6 +81,19 @@ class MigrationReport:
                 lines.append(f"  - {name}{note}")
         else:
             lines.append("No MCP servers found in Hermes config.")
+        if self.migrated_plugins:
+            lines.append(
+                f"Migrated {len(self.migrated_plugins)} native Codex plugin(s):"
+            )
+            for name in self.migrated_plugins:
+                lines.append(f"  - {name}")
+        elif self.plugin_query_error:
+            lines.append(f"Codex plugin discovery skipped: {self.plugin_query_error}")
+        if self.wrote_permissions_default:
+            lines.append(
+                f"Wrote [permissions] default = "
+                f"{self.wrote_permissions_default!r}"
+            )
         for err in self.errors:
             lines.append(f"⚠ {err}")
         return "\n".join(lines)
@@ -196,19 +223,52 @@ def _quote_key(key: str) -> str:
     escaped = key.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
 
+def render_codex_toml_section(
+    servers: dict[str, dict],
+    plugins: Optional[list[dict]] = None,
+    default_permission_profile: Optional[str] = None,
+) -> str:
+    """Render the managed [mcp_servers.<n>] / [plugins.<id>] / [permissions]
+    block for ~/.codex/config.toml.
 
-def render_codex_toml_section(servers: dict[str, dict]) -> str:
-    """Render an [mcp_servers.<name>] section block for the codex config.toml."""
+    Args:
+        servers: dict of MCP server name → translated codex inline-table
+        plugins: optional list of {name, marketplace, enabled} for native
+            Codex plugins to enable. (E.g. the Linear / Atlassian / Asana
+            curated plugins, or per-account ChatGPT apps.)
+        default_permission_profile: when set, write `[permissions] default`
+            so the user doesn't get an approval prompt on every write
+            attempt. Common values: "workspace-write", "read-only",
+            "full-access".
+    """
     out = [MIGRATION_MARKER]
-    if not servers:
-        out.append("# (no MCP servers configured in Hermes)")
+    if not servers and not plugins and not default_permission_profile:
+        out.append("# (no MCP servers, plugins, or permissions configured by Hermes)")
         return "\n".join(out) + "\n"
-    for name in sorted(servers.keys()):
-        cfg = servers[name]
+
+    if default_permission_profile:
         out.append("")
-        out.append(f"[mcp_servers.{_quote_key(name)}]")
-        for k, v in cfg.items():
-            out.append(f"{_quote_key(k)} = {_format_toml_value(v)}")
+        out.append("[permissions]")
+        out.append(f"default = {_format_toml_value(default_permission_profile)}")
+
+    if servers:
+        for name in sorted(servers.keys()):
+            cfg = servers[name]
+            out.append("")
+            out.append(f"[mcp_servers.{_quote_key(name)}]")
+            for k, v in cfg.items():
+                out.append(f"{_quote_key(k)} = {_format_toml_value(v)}")
+
+    if plugins:
+        for plugin in sorted(plugins, key=lambda p: f"{p.get('name','')}@{p.get('marketplace','')}"):
+            name = plugin.get("name") or ""
+            marketplace = plugin.get("marketplace") or "openai-curated"
+            enabled = bool(plugin.get("enabled", True))
+            qualified = f"{name}@{marketplace}"
+            out.append("")
+            out.append(f'[plugins.{_quote_key(qualified)}]')
+            out.append(f"enabled = {_format_toml_value(enabled)}")
+
     return "\n".join(out) + "\n"
 
 
@@ -216,7 +276,9 @@ def _strip_existing_managed_block(toml_text: str) -> str:
     """Remove any prior managed section so re-runs idempotently replace it.
 
     The managed section is everything between MIGRATION_MARKER and the next
-    section header that is NOT [mcp_servers.*] OR end-of-file."""
+    section header that is NOT [mcp_servers.*] / [plugins.*] / [permissions]
+    OR end-of-file. User-edited sections above or below the managed block
+    are preserved verbatim."""
     lines = toml_text.splitlines(keepends=True)
     out: list[str] = []
     in_managed = False
@@ -226,8 +288,16 @@ def _strip_existing_managed_block(toml_text: str) -> str:
             continue
         if in_managed:
             stripped = line.lstrip()
-            # Hand back control once we hit a non-mcp section.
-            if stripped.startswith("[") and not stripped.startswith("[mcp_servers"):
+            # Hand back control once we hit a section that's not part of
+            # what Hermes manages — codex's own config (model, providers,
+            # sandbox, otel, etc.) lives in those sections and we leave
+            # them alone.
+            if stripped.startswith("[") and not (
+                stripped.startswith("[mcp_servers")
+                or stripped.startswith("[plugins")
+                or stripped.startswith("[permissions]")
+                or stripped.startswith("[permissions.")
+            ):
                 in_managed = False
                 out.append(line)
             # Otherwise swallow the line (it's part of the old managed block).
@@ -236,18 +306,95 @@ def _strip_existing_managed_block(toml_text: str) -> str:
     return "".join(out)
 
 
+def _query_codex_plugins(
+    codex_home: Optional[Path] = None,
+    timeout: float = 8.0,
+) -> tuple[list[dict], Optional[str]]:
+    """Query codex's `plugin/list` for installed curated plugins.
+
+    Spawns `codex app-server` briefly, sends initialize + plugin/list,
+    extracts plugins where installed=true. Returns (plugins, error).
+    Plugins is a list of {name, marketplace, enabled} dicts ready for
+    render_codex_toml_section().
+
+    On any failure (codex not installed, RPC error, timeout) returns
+    ([], error_message). Migration treats this as non-fatal — MCP
+    servers and permissions still write through.
+    """
+    try:
+        from agent.transports.codex_app_server import CodexAppServerClient
+    except Exception as exc:
+        return [], f"transport unavailable: {exc}"
+
+    try:
+        with CodexAppServerClient(
+            codex_home=str(codex_home) if codex_home else None
+        ) as client:
+            client.initialize(client_name="hermes-migration")
+            resp = client.request("plugin/list", {}, timeout=timeout)
+    except Exception as exc:
+        return [], f"plugin/list query failed: {exc}"
+
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    marketplaces = resp.get("marketplaces") or []
+    if not isinstance(marketplaces, list):
+        return [], "plugin/list response missing 'marketplaces'"
+    for marketplace in marketplaces:
+        if not isinstance(marketplace, dict):
+            continue
+        market_name = str(marketplace.get("name") or "openai-curated")
+        plugins = marketplace.get("plugins") or []
+        if not isinstance(plugins, list):
+            continue
+        for plugin in plugins:
+            if not isinstance(plugin, dict):
+                continue
+            installed = bool(plugin.get("installed", False))
+            if not installed:
+                continue
+            name = str(plugin.get("name") or "")
+            if not name:
+                continue
+            key = (name, market_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            # Carry forward whatever 'enabled' codex reports — defaults to
+            # true for installed plugins. This is the same shape OpenClaw
+            # writes when migrating native codex plugins.
+            out.append({
+                "name": name,
+                "marketplace": market_name,
+                "enabled": bool(plugin.get("enabled", True)),
+            })
+    return out, None
+
+
 def migrate(
     hermes_config: dict,
     *,
     codex_home: Optional[Path] = None,
     dry_run: bool = False,
+    discover_plugins: bool = True,
+    default_permission_profile: Optional[str] = "workspace-write",
 ) -> MigrationReport:
-    """Translate Hermes mcp_servers config into ~/.codex/config.toml.
+    """Translate Hermes mcp_servers config + Codex curated plugins into
+    ~/.codex/config.toml.
 
     Args:
         hermes_config: full ~/.hermes/config.yaml dict
         codex_home: override CODEX_HOME (defaults to ~/.codex)
         dry_run: skip the actual write; report what would happen
+        discover_plugins: when True (default), query `plugin/list` against
+            the live codex CLI to migrate any installed curated plugins
+            into [plugins."<name>@<marketplace>"] entries. Set False to
+            skip the subprocess spawn (for tests or restricted environments).
+        default_permission_profile: when set (default "workspace-write"),
+            write [permissions] default = profile so users on this runtime
+            don't get an approval prompt on every write attempt. Set None
+            to leave permissions unset and let codex use its built-in
+            default (which is read-only).
     """
     report = MigrationReport(dry_run=dry_run)
     codex_home = codex_home or Path.home() / ".codex"
@@ -274,8 +421,26 @@ def migrate(
             report.skipped_keys_per_server[str(name)] = skipped
         report.migrated.append(str(name))
 
+    # Discover installed Codex curated plugins. Best-effort — never blocks
+    # the migration if codex is unreachable or the RPC fails.
+    plugins: list[dict] = []
+    if discover_plugins and not dry_run:
+        plugins, plugin_err = _query_codex_plugins(codex_home=codex_home)
+        if plugin_err:
+            report.plugin_query_error = plugin_err
+        for p in plugins:
+            report.migrated_plugins.append(f"{p['name']}@{p['marketplace']}")
+
+    # Track whether we wrote a default permission profile so the report
+    # surfaces it to the user.
+    if default_permission_profile:
+        report.wrote_permissions_default = default_permission_profile
+
     # Build the new managed block
-    managed_block = render_codex_toml_section(translated)
+    managed_block = render_codex_toml_section(
+        translated, plugins=plugins,
+        default_permission_profile=default_permission_profile,
+    )
 
     # Read existing codex config if any, strip the prior managed block,
     # append the new one.

@@ -369,3 +369,93 @@ class TestServerRequestRouting:
         s.run_turn("hi", turn_timeout=1.0)
         # Fail-closed: deny on callback exception
         assert ("r1", {"decision": "decline"}) in client.responses
+
+
+# ---- enriched approval prompts ----
+
+class TestApprovalPromptEnrichment:
+    """Quirk #4: apply_patch prompt should show what's changing.
+    Quirk #10: exec prompt should never show empty cwd."""
+
+    def test_exec_falls_back_to_session_cwd(self):
+        """When codex omits cwd from the approval params, the prompt shows
+        the session cwd, not an empty string."""
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval", request_id="r1",
+            command="ls",  # no cwd
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        captured = {}
+        def cb(command, description, *, allow_permanent=True):
+            captured["description"] = description
+            return "once"
+        s = make_session(client, approval_callback=cb)
+        s.run_turn("hi", turn_timeout=1.0)
+        # Session cwd is /tmp by default in make_session()
+        assert "/tmp" in captured["description"]
+        assert "Codex requests exec in <unknown>" not in captured["description"]
+
+    def test_apply_patch_prompt_summarizes_pending_changes(self):
+        """When the projector has cached the fileChange item from item/started,
+        the approval prompt surfaces the change summary."""
+        client = FakeClient()
+        # item/started fires first (carries the changes), then approval request
+        client.queue_notification(
+            "item/started",
+            item={"type": "fileChange", "id": "fc-1",
+                  "changes": [
+                      {"kind": {"type": "add"}, "path": "/tmp/new.py"},
+                      {"kind": {"type": "update"}, "path": "/tmp/old.py"},
+                  ]},
+            threadId="t", turnId="tu1",
+        )
+        client.queue_server_request(
+            "item/fileChange/requestApproval", request_id="req-2",
+            itemId="fc-1", turnId="tu1", threadId="t",
+            startedAtMs=1234567890,
+            reason="add and update files",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        captured = {}
+        def cb(command, description, *, allow_permanent=True):
+            captured["command"] = command
+            captured["description"] = description
+            return "once"
+        s = make_session(client, approval_callback=cb)
+        s.run_turn("hi", turn_timeout=1.0)
+        # Both add and update kinds should be in the summary
+        assert "1 add" in captured["command"] or "1 add" in captured["description"]
+        assert "1 update" in captured["command"] or "1 update" in captured["description"]
+        # And at least one of the paths
+        joined = captured["command"] + " " + captured["description"]
+        assert "/tmp/new.py" in joined or "/tmp/old.py" in joined
+
+    def test_apply_patch_prompt_works_without_cached_summary(self):
+        """When approval arrives before item/started (or without changes
+        info), prompt falls back to whatever codex provided."""
+        client = FakeClient()
+        client.queue_server_request(
+            "item/fileChange/requestApproval", request_id="req-2",
+            itemId="fc-orphan", turnId="tu1", threadId="t",
+            startedAtMs=1234567890,
+            reason="apply some changes",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        captured = {}
+        def cb(command, description, *, allow_permanent=True):
+            captured["command"] = command
+            return "once"
+        s = make_session(client, approval_callback=cb)
+        s.run_turn("hi", turn_timeout=1.0)
+        # Falls back to the reason
+        assert "apply some changes" in captured["command"]
