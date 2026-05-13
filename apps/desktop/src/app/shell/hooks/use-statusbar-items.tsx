@@ -4,7 +4,7 @@ import { useCallback, useMemo, useState } from 'react'
 import type { CommandCenterSection } from '@/app/command-center'
 import { GatewayMenuPanel } from '@/app/shell/gateway-menu-panel'
 import { restartGateway } from '@/hermes'
-import { Activity, AlertCircle, Command, Cpu, FolderOpen, GitBranch, Hash, Loader2, Sparkles } from '@/lib/icons'
+import { Activity, AlertCircle, Clock, Command, Cpu, FolderOpen, GitBranch, Hash, Loader2, Sparkles } from '@/lib/icons'
 import { compactPath, contextBarLabel, LiveDuration, usageContextLabel } from '@/lib/statusbar'
 import { cn } from '@/lib/utils'
 import { $desktopActionTasks } from '@/store/activity'
@@ -25,6 +25,7 @@ import {
 import { $desktopVersion, $updateApply, $updateStatus, setUpdateOverlayOpen } from '@/store/updates'
 import type { StatusResponse } from '@/types/hermes'
 
+import { CRON_ROUTE } from '../../routes'
 import type { StatusbarItem } from '../statusbar-controls'
 
 interface StatusbarItemsOptions {
@@ -202,6 +203,14 @@ export function useStatusbarItems({
         label: 'Agents',
         onSelect: openAgents,
         title: agentsOpen ? 'Close agents' : 'Open agents',
+        variant: 'action'
+      },
+      {
+        icon: <Clock className="size-3" />,
+        id: 'cron',
+        label: 'Cron',
+        title: 'Open cron jobs',
+        to: CRON_ROUTE,
         variant: 'action'
       }
     ],

@@ -2,11 +2,21 @@ import { useStore } from '@nanostores/react'
 import type { ComponentProps, ReactNode } from 'react'
 import { useNavigate } from 'react-router-dom'
 
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger
+} from '@/components/ui/dropdown-menu'
 import { triggerHaptic } from '@/lib/haptics'
-import { FolderOpen, NotebookTabs, Settings, Volume2, VolumeX } from '@/lib/icons'
+import { FolderOpen, NotebookTabs, Settings, Users, Volume2, VolumeX } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { $hapticsMuted, toggleHapticsMuted } from '@/store/haptics'
 import { $fileBrowserOpen, $sidebarOpen, toggleFileBrowserOpen, toggleSidebarOpen } from '@/store/layout'
+
+import { PROFILES_ROUTE } from '../routes'
 
 import { titlebarButtonClass } from './titlebar'
 
@@ -95,6 +105,8 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
   ]
 
   const visibleSystemTools = systemTools.filter(tool => !tool.hidden)
+  const settingsTool = visibleSystemTools.find(tool => tool.id === 'settings')
+  const visibleSystemToolsBeforeSettings = visibleSystemTools.filter(tool => tool.id !== 'settings')
   const visiblePaneTools = tools.filter(tool => !tool.hidden)
 
   return (
@@ -133,11 +145,52 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
         aria-label="App controls"
         className="fixed right-(--titlebar-tools-right) top-(--titlebar-controls-top) z-70 flex flex-row items-center justify-end gap-x-1 pointer-events-auto select-none [-webkit-app-region:no-drag]"
       >
-        {visibleSystemTools.map(tool => (
+        {visibleSystemToolsBeforeSettings.map(tool => (
           <TitlebarToolButton key={tool.id} navigate={navigate} tool={tool} />
         ))}
+        <ProfilesMenuButton navigate={navigate} />
+        {settingsTool && <TitlebarToolButton navigate={navigate} tool={settingsTool} />}
       </div>
     </>
+  )
+}
+
+function ProfilesMenuButton({ navigate }: { navigate: ReturnType<typeof useNavigate> }) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          aria-label="Profiles"
+          className={cn(
+            titlebarButtonClass,
+            'grid place-items-center bg-transparent select-none [&_svg]:size-4'
+          )}
+          onPointerDown={event => event.stopPropagation()}
+          title="Profiles"
+          type="button"
+        >
+          <Users />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-64" sideOffset={8}>
+        <DropdownMenuLabel>
+          <div className="text-sm font-medium text-foreground">Profiles</div>
+          <div className="mt-1 text-xs font-normal leading-4 text-muted-foreground">
+            Advanced Hermes environments for separate personas, config, skills, and SOUL.md.
+          </div>
+        </DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem
+          onSelect={() => {
+            triggerHaptic('open')
+            navigate(PROFILES_ROUTE)
+          }}
+        >
+          <Users className="size-4" />
+          <span>Manage profiles</span>
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }
 

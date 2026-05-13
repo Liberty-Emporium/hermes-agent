@@ -54,10 +54,8 @@ export type CommandDispatchResponse =
 export type SidebarNavId =
   | 'artifacts'
   | 'command-center'
-  | 'cron'
   | 'messaging'
   | 'new-session'
-  | 'profiles'
   | 'settings'
   | 'skills'
 
