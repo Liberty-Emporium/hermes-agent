@@ -1167,6 +1167,26 @@ SESSION_SEARCH_SCHEMA = {
         "for a specific mode, prefer fast. Don't reflexively pick summary for 'catch me up' "
         "or 'what did we decide' questions — fast→guided answers those cheaper and shows you "
         "the actual messages instead of an LLM recap of them.\n\n"
+        "MULTI-SESSION CATCH-UP: when a topic spans multiple sessions (e.g. 'where did we get to "
+        "with X' over several days, or active work that's been touched in several recent "
+        "sessions), do NOT drill only the top fast hit. Pass the top 2–3 hits as a multi-anchor "
+        "guided call: ``mode='guided', anchors=[{session_id, around_message_id}, ...]``. Each "
+        "anchor returns its own window + bookends in one call, so you see the full arc instead "
+        "of one session's slice. A single-anchor drill is fine when the topic is contained to "
+        "one session.\n\n"
+        "READING GUIDED RESPONSES: every guided window has three slices — ``bookend_start`` "
+        "(opening prose of that session, may be empty when the window already covers the "
+        "start), ``messages`` (the anchored window itself, the FTS5 hit + its neighbours), and "
+        "``bookend_end`` (closing prose of that session). Read all three — the resolution lives "
+        "in bookend_end, the goal in bookend_start. Skipping them leaves you anchored on the "
+        "FTS5 hit alone and missing what came before/after.\n\n"
+        "LINEAGE AWARENESS: sessions can be split by context compaction — when this happens, "
+        "the child session's first messages are a post-compaction handoff, NOT the original "
+        "arc opener. Spot it by ``parent_session_id`` on a fast hit (or in the guided response's "
+        "session_meta). If ``bookend_start`` reads like a summary-of-prior-work rather than a "
+        "user kickoff, the real opener is in the parent — fast-search again scoped to the "
+        "parent if you need it. Most sessions are not compacted; this only matters on long "
+        "multi-day arcs.\n\n"
         "Browsing recent sessions: call with NO arguments to see what was worked on recently. "
         "Returns titles, previews, timestamps. Zero LLM cost, instant. Start here when the user "
         "asks 'what were we working on' or 'what did we do recently'.\n\n"
@@ -1227,7 +1247,7 @@ SESSION_SEARCH_SCHEMA = {
             },
             "anchors": {
                 "type": "array",
-                "description": "Required for mode='guided'. List of {session_id, around_message_id} dicts to drill into. Copy session_id and match_message_id verbatim from prior fast-mode results — they pair as a single self-consistent handle. Do NOT substitute parent_session_id (shown for display context only; pairs incorrectly with match_message_id). One anchor is fine for single drills; multiple anchors get drilled in one call and one window per anchor is returned.",
+                "description": "Required for mode='guided'. List of {session_id, around_message_id} dicts to drill into. Copy session_id and match_message_id verbatim from prior fast-mode results — they pair as a single self-consistent handle. Do NOT substitute parent_session_id (shown for display context only; pairs incorrectly with match_message_id). One anchor is fine when the topic lives in a single session; for multi-session catch-up (topic touched across several recent sessions), pass the top 2–3 fast hits as separate anchors in ONE call — each gets its own window + bookends in the response's 'windows' array.",
                 "items": {
                     "type": "object",
                     "properties": {
