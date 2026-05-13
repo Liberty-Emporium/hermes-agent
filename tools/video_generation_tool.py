@@ -467,8 +467,16 @@ _GENERIC_DESCRIPTION = (
 )
 
 
-def _format_model_caveats(model_meta: Dict[str, Any]) -> List[str]:
-    """Pull human-readable caveats out of one model's catalog metadata."""
+def _format_model_caveats(
+    model_meta: Dict[str, Any],
+    backend_caps: Dict[str, Any],
+) -> List[str]:
+    """Pull human-readable caveats out of one model's catalog metadata.
+
+    Only surfaces things that meaningfully **differ from the backend's
+    overall capabilities** — repeating "operations: generate" when the
+    backend line already says the same thing is noise.
+    """
     caveats: List[str] = []
 
     modalities = model_meta.get("modalities") or []
@@ -487,9 +495,15 @@ def _format_model_caveats(model_meta: Dict[str, Any]) -> List[str]:
     elif modality == "text":
         caveats.append("text-to-video only — image_url is not supported")
 
-    ops = model_meta.get("operations") or []
-    if ops and set(ops) != {"generate"}:
-        caveats.append(f"operations supported by this model: {', '.join(sorted(ops))}")
+    # Model-level operations: only surface if they're narrower than the
+    # backend's overall set. A backend that says "generate, edit, extend"
+    # with a model that also supports all three doesn't need the repetition.
+    model_ops = set(model_meta.get("operations") or [])
+    backend_ops = set(backend_caps.get("operations") or [])
+    if model_ops and backend_ops and model_ops < backend_ops:
+        caveats.append(
+            f"this model supports only: {', '.join(sorted(model_ops))}"
+        )
 
     return caveats
 
@@ -552,7 +566,7 @@ def _build_dynamic_video_schema() -> Dict[str, Any]:
     parts.append(line)
 
     # Model-specific caveats — the high-signal stuff that prevents wasted turns
-    caveats = _format_model_caveats(model_meta)
+    caveats = _format_model_caveats(model_meta, caps)
     for c in caveats:
         parts.append(f"- {c}")
 
