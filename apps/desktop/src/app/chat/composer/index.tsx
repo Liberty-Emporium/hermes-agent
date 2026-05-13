@@ -13,6 +13,7 @@ import {
 } from 'react'
 
 import { formatRefValue, hermesDirectiveFormatter } from '@/components/assistant-ui/directive-text'
+import { Button } from '@/components/ui/button'
 import { useMediaQuery } from '@/hooks/use-media-query'
 import { useResizeObserver } from '@/hooks/use-resize-observer'
 import { chatMessageText } from '@/lib/chat-messages'
@@ -20,7 +21,19 @@ import { contextPath } from '@/lib/chat-runtime'
 import { DATA_IMAGE_URL_RE } from '@/lib/embedded-images'
 import { triggerHaptic } from '@/lib/haptics'
 import { cn } from '@/lib/utils'
-import { $composerAttachments, $composerDraft } from '@/store/composer'
+import {
+  $composerAttachments,
+  $composerDraft,
+  clearComposerAttachments,
+  type ComposerAttachment
+} from '@/store/composer'
+import {
+  $queuedPromptsBySession,
+  enqueueQueuedPrompt,
+  removeQueuedPrompt,
+  type QueuedPromptEntry,
+  updateQueuedPrompt
+} from '@/store/composer-queue'
 import { $messages } from '@/store/session'
 import { $threadScrolledUp } from '@/store/thread-scroll'
 
@@ -41,6 +54,7 @@ import {
   renderComposerContents,
   RICH_INPUT_SLOT
 } from './rich-editor'
+import { QueuePanel } from './queue-panel'
 import { SkinSlashPopover } from './skin-slash-popover'
 import { detectTrigger, extractClipboardImageBlobs, textBeforeCaret, type TriggerState } from './text-utils'
 import { ComposerTriggerPopover } from './trigger-popover'
@@ -53,6 +67,15 @@ const COMPOSER_STACK_BREAKPOINT_PX = 320
 const COMPOSER_FADE_BACKGROUND =
   'linear-gradient(to bottom, transparent, color-mix(in srgb, var(--dt-background) 10%, transparent))'
 
+interface QueueEditState {
+  attachments: ComposerAttachment[]
+  draft: string
+  entryId: string
+  sessionKey: string
+}
+
+const cloneAttachments = (attachments: ComposerAttachment[]) => attachments.map(a => ({ ...a }))
+
 export function ChatBar({
   busy,
   cwd,
@@ -60,6 +83,7 @@ export function ChatBar({
   focusKey,
   gateway,
   maxRecordingSeconds = 120,
+  queueSessionKey,
   sessionId,
   state,
   onCancel,
@@ -77,12 +101,17 @@ export function ChatBar({
   const aui = useAui()
   const draft = useAuiState(s => s.composer.text)
   const attachments = useStore($composerAttachments)
+  const queuedPromptsBySession = useStore($queuedPromptsBySession)
   const scrolledUp = useStore($threadScrolledUp)
+  const activeQueueSessionKey = queueSessionKey || sessionId || null
+  const queuedPrompts = activeQueueSessionKey ? (queuedPromptsBySession[activeQueueSessionKey] ?? []) : []
 
   const composerRef = useRef<HTMLFormElement | null>(null)
   const composerSurfaceRef = useRef<HTMLDivElement | null>(null)
   const editorRef = useRef<HTMLDivElement | null>(null)
   const draftRef = useRef(draft)
+  const previousBusyRef = useRef(busy)
+  const drainingQueueRef = useRef(false)
   const urlInputRef = useRef<HTMLInputElement | null>(null)
 
   const [urlOpen, setUrlOpen] = useState(false)
@@ -91,6 +120,7 @@ export function ChatBar({
   const [voiceConversationActive, setVoiceConversationActive] = useState(false)
   const [tight, setTight] = useState(false)
   const [dragActive, setDragActive] = useState(false)
+  const [queueEdit, setQueueEdit] = useState<QueueEditState | null>(null)
   const dragDepthRef = useRef(0)
   const lastSpokenIdRef = useRef<string | null>(null)
 
@@ -102,6 +132,8 @@ export function ChatBar({
   const stacked = expanded || narrow || tight
   const hasComposerPayload = draft.trim().length > 0 || attachments.length > 0
   const canSubmit = busy || hasComposerPayload
+  const editingQueuedPrompt = queueEdit ? queuedPrompts.find(entry => entry.id === queueEdit.entryId) ?? null : null
+  const busyAction = busy && hasComposerPayload ? 'queue' : 'stop'
   const showHelpHint = draft === '?'
 
   const placeholder = disabled ? 'Starting Hermes…' : 'Ask anything'
@@ -463,6 +495,14 @@ export function ChatBar({
   }
 
   const handleEditorKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if ((event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === 'k') {
+      event.preventDefault()
+
+      if (!busy) void drainNextQueued()
+
+      return
+    }
+
     if (trigger && triggerItems.length > 0) {
       if (event.key === 'ArrowDown') {
         event.preventDefault()
@@ -499,6 +539,13 @@ export function ChatBar({
 
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault()
+
+      if (!busy && !hasComposerPayload && queuedPrompts.length > 0) {
+        void drainNextQueued()
+
+        return
+      }
+
       submitDraft()
     }
   }
@@ -635,10 +682,147 @@ export function ChatBar({
     }
   }
 
-  const submitDraft = () => {
-    if (busy) {
+  const loadIntoComposer = (text: string, attachments: ComposerAttachment[]) => {
+    draftRef.current = text
+    aui.composer().setText(text)
+    $composerAttachments.set(cloneAttachments(attachments))
+
+    const editor = editorRef.current
+
+    if (editor) {
+      renderComposerContents(editor, text)
+      placeCaretEnd(editor)
+    }
+  }
+
+  const beginQueuedEdit = (entry: QueuedPromptEntry) => {
+    if (!activeQueueSessionKey || queueEdit) return
+
+    setQueueEdit({
+      attachments: cloneAttachments($composerAttachments.get()),
+      draft: draftRef.current,
+      entryId: entry.id,
+      sessionKey: activeQueueSessionKey
+    })
+    loadIntoComposer(entry.text, entry.attachments)
+    triggerHaptic('selection')
+    focusInput()
+  }
+
+  const exitQueuedEdit = (action: 'cancel' | 'save'): boolean => {
+    if (!queueEdit) return false
+
+    if (action === 'save') {
+      const text = draftRef.current
+      const next = cloneAttachments($composerAttachments.get())
+
+      if (!text.trim() && next.length === 0) return false
+
+      const saved = updateQueuedPrompt(queueEdit.sessionKey, queueEdit.entryId, { attachments: next, text })
+      triggerHaptic(saved ? 'success' : 'selection')
+    } else {
       triggerHaptic('cancel')
-      onCancel()
+    }
+
+    loadIntoComposer(queueEdit.draft, queueEdit.attachments)
+    setQueueEdit(null)
+    focusInput()
+
+    return true
+  }
+
+  const queueCurrentDraft = useCallback(() => {
+    if (!activeQueueSessionKey || (!draft.trim() && attachments.length === 0)) return false
+    if (!enqueueQueuedPrompt(activeQueueSessionKey, { text: draft, attachments })) return false
+
+    clearDraft()
+    clearComposerAttachments()
+    triggerHaptic('selection')
+
+    return true
+  }, [activeQueueSessionKey, attachments, draft])
+
+  // All queue drain paths share one lock + send-then-remove sequence.
+  // `pickEntry` lets each caller choose head, by-id, or skip-edited.
+  const runDrain = useCallback(
+    async (pickEntry: (entries: QueuedPromptEntry[]) => QueuedPromptEntry | undefined): Promise<boolean> => {
+      if (drainingQueueRef.current || !activeQueueSessionKey) return false
+
+      const entry = pickEntry(queuedPrompts)
+
+      if (!entry) return false
+
+      drainingQueueRef.current = true
+
+      try {
+        const accepted = await Promise.resolve(onSubmit(entry.text, { attachments: entry.attachments, fromQueue: true }))
+
+        if (accepted === false) return false
+
+        removeQueuedPrompt(activeQueueSessionKey, entry.id)
+
+        return true
+      } finally {
+        drainingQueueRef.current = false
+      }
+    },
+    [activeQueueSessionKey, onSubmit, queuedPrompts]
+  )
+
+  const drainNextQueued = useCallback(
+    () =>
+      runDrain(entries => {
+        const skip = queueEdit?.entryId
+
+        return skip ? entries.find(e => e.id !== skip) : entries[0]
+      }),
+    [queueEdit, runDrain]
+  )
+
+  const sendQueuedNow = useCallback(
+    (id: string) => runDrain(entries => entries.find(e => e.id === id && id !== queueEdit?.entryId)),
+    [queueEdit, runDrain]
+  )
+
+  const interruptAndSendNextQueued = useCallback(async () => {
+    if (queuedPrompts.length === 0) return false
+
+    await Promise.resolve(onCancel())
+
+    return drainNextQueued()
+  }, [drainNextQueued, onCancel, queuedPrompts.length])
+
+  // Auto-drain on busy → false (turn settled).
+  useEffect(() => {
+    const wasBusy = previousBusyRef.current
+    previousBusyRef.current = busy
+
+    if (busy || !wasBusy || queuedPrompts.length === 0) return
+
+    void drainNextQueued()
+  }, [busy, drainNextQueued, queuedPrompts.length])
+
+  // Clean up queue edit when its target disappears (session swap or external delete).
+  useEffect(() => {
+    if (!queueEdit) return
+    if (queueEdit.sessionKey === activeQueueSessionKey && editingQueuedPrompt) return
+
+    loadIntoComposer(queueEdit.draft, queueEdit.attachments)
+    setQueueEdit(null)
+  }, [activeQueueSessionKey, editingQueuedPrompt, queueEdit]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const submitDraft = () => {
+    if (queueEdit) {
+      exitQueuedEdit('save')
+    } else if (busy) {
+      if (hasComposerPayload) queueCurrentDraft()
+      else if (queuedPrompts.length > 0) void interruptAndSendNextQueued()
+      else {
+        triggerHaptic('cancel')
+        void Promise.resolve(onCancel())
+      }
+    } else if (!hasComposerPayload && queuedPrompts.length > 0) {
+      void drainNextQueued()
     } else if (draft.trim() || attachments.length > 0) {
       const submitted = draft
       triggerHaptic('submit')
@@ -742,6 +926,7 @@ export function ChatBar({
   const controls = (
     <ComposerControls
       busy={busy}
+      busyAction={busyAction}
       canSubmit={canSubmit}
       conversation={{
         active: voiceConversationActive,
@@ -824,6 +1009,22 @@ export function ChatBar({
             />
           )}
           <SkinSlashPopover draft={draft} onSelect={selectSkinSlashCommand} />
+          {activeQueueSessionKey && queuedPrompts.length > 0 && (
+            <div className="relative z-6 mb-1 px-0.5">
+              <QueuePanel
+                busy={busy}
+                editingId={queueEdit?.entryId ?? null}
+                entries={queuedPrompts}
+                onDelete={id => {
+                  if (removeQueuedPrompt(activeQueueSessionKey, id) && queueEdit?.entryId === id) {
+                    exitQueuedEdit('cancel')
+                  }
+                }}
+                onEdit={beginQueuedEdit}
+                onSendNow={id => void sendQueuedNow(id)}
+              />
+            </div>
+          )}
           <div
             className="pointer-events-none absolute inset-0 rounded-[inherit]"
             style={{ background: COMPOSER_FADE_BACKGROUND }}
@@ -871,6 +1072,28 @@ export function ChatBar({
               >
                 <VoiceActivity state={voiceActivityState} />
                 <VoicePlaybackActivity />
+                {queueEdit && editingQueuedPrompt && (
+                  <div className="flex items-center justify-between gap-2 rounded-lg border border-[color-mix(in_srgb,var(--dt-composer-ring)_32%,transparent)] bg-accent/18 px-2 py-1">
+                    <div className="min-w-0 text-[0.7rem] text-muted-foreground/88">Editing queued turn in composer</div>
+                    <div className="flex shrink-0 items-center gap-1">
+                      <Button
+                        className="h-6 rounded-md px-2 text-[0.68rem]"
+                        onClick={() => exitQueuedEdit('cancel')}
+                        type="button"
+                        variant="ghost"
+                      >
+                        Cancel
+                      </Button>
+                      <Button
+                        className="h-6 rounded-md px-2 text-[0.68rem]"
+                        onClick={() => exitQueuedEdit('save')}
+                        type="button"
+                      >
+                        Save
+                      </Button>
+                    </div>
+                  </div>
+                )}
                 {attachments.length > 0 && <AttachmentList attachments={attachments} onRemove={onRemoveAttachment} />}
                 <div
                   className={cn(

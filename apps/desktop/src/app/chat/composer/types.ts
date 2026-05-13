@@ -1,4 +1,5 @@
 import type { HermesGateway } from '@/hermes'
+import type { ComposerAttachment } from '@/store/composer'
 
 import type { DroppedFile } from '../hooks/use-composer-actions'
 
@@ -33,9 +34,10 @@ export interface ChatBarProps {
   maxRecordingSeconds?: number
   state: ChatBarState
   gateway?: HermesGateway | null
+  queueSessionKey?: string | null
   sessionId?: string | null
   cwd?: string | null
-  onCancel: () => void
+  onCancel: () => Promise<void> | void
   onAddContextRef?: (refText: string, label?: string, detail?: string) => void
   onAddUrl?: (url: string) => void
   onAttachImageBlob?: (blob: Blob) => Promise<boolean | void> | boolean | void
@@ -45,7 +47,10 @@ export interface ChatBarProps {
   onPickFolders?: () => void
   onPickImages?: () => void
   onRemoveAttachment?: (id: string) => void
-  onSubmit: (value: string) => Promise<void> | void
+  onSubmit: (
+    value: string,
+    options?: { attachments?: ComposerAttachment[]; fromQueue?: boolean }
+  ) => Promise<boolean> | boolean
   onTranscribeAudio?: (audio: Blob) => Promise<string>
 }
 

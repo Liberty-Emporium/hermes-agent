@@ -71,6 +71,11 @@ interface PromptActionsOptions {
   ) => ClientSessionState
 }
 
+interface SubmitTextOptions {
+  attachments?: ComposerAttachment[]
+  fromQueue?: boolean
+}
+
 function renderCommandsCatalog(catalog: CommandsCatalogLike): string {
   const desktopCatalog = filterDesktopCommandsCatalog(catalog)
 
@@ -153,7 +158,12 @@ export function usePromptActions({
   )
 
   const syncImageAttachmentsForSubmit = useCallback(
-    async (sessionId: string, attachments: ComposerAttachment[]) => {
+    async (
+      sessionId: string,
+      attachments: ComposerAttachment[],
+      options: { updateComposerAttachments?: boolean } = {}
+    ) => {
+      const updateComposerAttachments = options.updateComposerAttachments ?? true
       const images = attachments.filter(attachment => attachment.kind === 'image' && attachment.path)
 
       for (const attachment of images) {
@@ -173,22 +183,25 @@ export function usePromptActions({
 
         const attachedPath = result.path || attachment.path
 
-        addComposerAttachment({
-          ...attachment,
-          id: attachment.id,
-          label: attachedPath ? pathLabel(attachedPath) : attachment.label,
-          path: attachedPath,
-          attachedSessionId: sessionId
-        })
+        if (updateComposerAttachments) {
+          addComposerAttachment({
+            ...attachment,
+            id: attachment.id,
+            label: attachedPath ? pathLabel(attachedPath) : attachment.label,
+            path: attachedPath,
+            attachedSessionId: sessionId
+          })
+        }
       }
     },
     [requestGateway]
   )
 
   const submitPromptText = useCallback(
-    async (rawText: string) => {
+    async (rawText: string, options?: SubmitTextOptions) => {
       const visibleText = rawText.trim()
-      const attachments = $composerAttachments.get()
+      const usingComposerAttachments = !options?.attachments
+      const attachments = options?.attachments ?? $composerAttachments.get()
       const contextRefs = attachments
         .map(a => a.refText)
         .filter(Boolean)
@@ -200,7 +213,7 @@ export function usePromptActions({
         [contextRefs, visibleText].filter(Boolean).join('\n\n') || (hasImage ? 'What do you see in this image?' : '')
 
       if (!text || busyRef.current) {
-        return
+        return false
       }
 
       const optimisticId = `user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
@@ -232,7 +245,7 @@ export function usePromptActions({
             awaitingResponse: true,
             pendingBranchGroup: null,
             sawAssistantPayload: false,
-            interrupted: false
+            interrupted: state.interrupted
           }),
           selectedStoredSessionIdRef.current
         )
@@ -278,7 +291,7 @@ export function usePromptActions({
           releaseBusy()
           notifyError(err, 'Session unavailable')
 
-          return
+          return false
         }
 
         if (!sessionId) {
@@ -286,16 +299,21 @@ export function usePromptActions({
           releaseBusy()
           notify({ kind: 'error', title: 'Session unavailable', message: 'Could not create a new session' })
 
-          return
+          return false
         }
 
         seedOptimistic(sessionId)
       }
 
       try {
-        await syncImageAttachmentsForSubmit(sessionId, attachments)
+        await syncImageAttachmentsForSubmit(sessionId, attachments, {
+          updateComposerAttachments: usingComposerAttachments
+        })
         await requestGateway('prompt.submit', { session_id: sessionId, text })
-        clearComposerAttachments()
+
+        if (usingComposerAttachments) clearComposerAttachments()
+
+        return true
       } catch (err) {
         releaseBusy()
         updateSessionState(sessionId, state => ({ ...state, busy: false, awaitingResponse: false }))
@@ -303,10 +321,11 @@ export function usePromptActions({
         if (isProviderSetupError(err)) {
           requestDesktopOnboarding('Add a provider credential before sending your first message.')
 
-          return
+          return false
         }
 
         notifyError(err, 'Prompt failed')
+        return false
       }
     },
     [
@@ -477,18 +496,18 @@ export function usePromptActions({
   )
 
   const submitText = useCallback(
-    async (rawText: string) => {
+    async (rawText: string, options?: SubmitTextOptions) => {
       const visibleText = rawText.trim()
-      const attachments = $composerAttachments.get()
+      const attachments = options?.attachments ?? $composerAttachments.get()
 
       if (!attachments.length && SLASH_COMMAND_RE.test(visibleText)) {
         triggerHaptic('selection')
         await executeSlashCommand(visibleText)
 
-        return
+        return true
       }
 
-      await submitPromptText(rawText)
+      return await submitPromptText(rawText, options)
     },
     [executeSlashCommand, submitPromptText]
   )

@@ -7,6 +7,7 @@ import { type ChatMessage, chatMessageText, toChatMessages } from '@/lib/chat-me
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
 import { clearComposerAttachments, clearComposerDraft } from '@/store/composer'
+import { clearQueuedPrompts } from '@/store/composer-queue'
 import { $pinnedSessionIds } from '@/store/layout'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
@@ -649,6 +650,11 @@ export function useSessionActions({
         }
 
         await deleteSession(storedSessionId)
+        clearQueuedPrompts(storedSessionId)
+
+        if (closingRuntimeId) {
+          clearQueuedPrompts(closingRuntimeId)
+        }
       } catch (err) {
         if (removed) {
           setSessions(prev => [removed, ...prev])

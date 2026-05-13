@@ -20,6 +20,7 @@ import { ChevronDown } from '@/lib/icons'
 import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
 import { cn } from '@/lib/utils'
 import { $pinnedSessionIds } from '@/store/layout'
+import type { ComposerAttachment } from '@/store/composer'
 import {
   $activeSessionId,
   $awaitingResponse,
@@ -51,7 +52,7 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   gateway: HermesGateway | null
   onToggleSelectedPin: () => void
   onDeleteSelectedSession: () => void
-  onCancel: () => void
+  onCancel: () => Promise<void> | void
   onAddContextRef: (refText: string, label?: string, detail?: string) => void
   onAddUrl: (url: string) => void
   onBranchInNewChat: (messageId: string) => void
@@ -63,7 +64,10 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   onPickFolders: () => void
   onPickImages: () => void
   onRemoveAttachment: (id: string) => void
-  onSubmit: (text: string) => Promise<void> | void
+  onSubmit: (
+    text: string,
+    options?: { attachments?: ComposerAttachment[]; fromQueue?: boolean }
+  ) => Promise<boolean> | boolean
   onThreadMessagesChange: (messages: readonly ThreadMessage[]) => void
   onEdit: (message: AppendMessage) => Promise<void>
   onReload: (parentId: string | null) => Promise<void>
@@ -311,6 +315,7 @@ export function ChatView({
                 onRemoveAttachment={onRemoveAttachment}
                 onSubmit={onSubmit}
                 onTranscribeAudio={onTranscribeAudio}
+                queueSessionKey={selectedSessionId || activeSessionId}
                 sessionId={activeSessionId}
                 state={chatBarState}
               />
