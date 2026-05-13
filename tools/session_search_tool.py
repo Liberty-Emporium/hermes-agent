@@ -1035,10 +1035,12 @@ SESSION_SEARCH_SCHEMA = {
         "you usually want for 'what did we decide about X?' questions. ~30s, ~3-4 KB per session.\n"
         "  • mode='fast' — FTS5 snippets + 1 message of context, no LLM call. ~10ms, ~1 KB per "
         "session. Use for 'find the latest session about Y' — discovery, not synthesis.\n"
-        "Follow-up move (only useful AFTER a starting move identified the right anchor):\n"
+        "Follow-up move (REQUIRES anchors from a prior fast or summary call):\n"
         "  • mode='guided' — given (session_id, message_id) pairs from prior fast-mode results, "
         "returns a window of raw messages around each anchor. No LLM, no truncation, ~ms latency. "
-        "Cannot be a starting move on its own — it needs anchors, which come from fast.\n\n"
+        "**If you have no prior fast hit, call fast FIRST and use its match_message_id values as "
+        "anchors. Never invent anchors or guess session_ids — guided will reject pairs that don't "
+        "match real messages.**\n\n"
         "Browsing recent sessions: call with NO arguments to see what was worked on recently. "
         "Returns titles, previews, timestamps. Zero LLM cost, instant. Start here when the user "
         "asks 'what were we working on' or 'what did we do recently'.\n\n"
@@ -1047,6 +1049,11 @@ SESSION_SEARCH_SCHEMA = {
         "passed explicitly, that user-configured value applies (then 'summary' as the final "
         "fallback).\n\n"
         "USE THIS PROACTIVELY when:\n"
+        "- **BEFORE reaching for `gh`, GitHub API, web search, or file inspection**: if the user "
+        "asks about the status of any project, branch, PR, design, or topic that's been worked on "
+        "before, call session_search FIRST. The session DB carries what was DISCUSSED and DECIDED; "
+        "external tools only show the current world state. Use session_search to find context, "
+        "then external tools to verify reality.\n"
         "- The user says 'we did this before', 'remember when', 'last time', 'as I mentioned'\n"
         "- The user asks about a topic you worked on before but don't have in current context\n"
         "- The user references a project, person, or concept that seems familiar but isn't in memory\n"
@@ -1082,9 +1089,10 @@ SESSION_SEARCH_SCHEMA = {
                 "enum": ["fast", "summary", "guided"],
                 "description": (
                     "summary (default) — LLM recap of each matched session. fast — FTS5 snippets, "
-                    "no LLM, ~10ms. guided — given anchors from a prior fast hit, returns raw "
-                    "message windows; cannot be a starting move (always follows fast or summary). "
-                    "See the tool description for when to use which."
+                    "no LLM, ~10ms. guided — REQUIRES anchors from a prior fast or summary call. "
+                    "If you want to drill but have no anchors yet, call fast first and use its "
+                    "match_message_id values. Never invent anchors. See the tool description for "
+                    "when to use which."
                 ),
                 "default": "summary",
             },
