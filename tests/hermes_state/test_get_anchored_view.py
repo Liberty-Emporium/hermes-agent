@@ -147,3 +147,43 @@ def test_bookends_do_not_leak_across_sessions(db):
         + [m["id"] for m in view["bookend_end"]]
     )
     assert set(bookend_ids).isdisjoint(set(s2_ids))
+
+
+def test_bookends_skip_empty_content_assistant_turns(db):
+    """Tool-call-only assistant turns (content='' with tool_calls populated)
+    must NOT eat bookend slots. Bookends exist to surface the session's
+    spoken opening + resolution; 'let me check...'-shaped no-content
+    assistants are signal-free here."""
+    db.create_session("s1", source="cli")
+    # Real opener
+    open_id = db.append_message("s1", role="user", content="kick off the work")
+    db.append_message("s1", role="assistant", content="on it")
+    # A burst of tool-call-only assistants (orchestration heartbeats)
+    for _ in range(5):
+        db.append_message("s1", role="assistant", content="")
+        db.append_message("s1", role="tool", content="some output")
+    # Middle prose
+    mid_id = db.append_message("s1", role="user", content="status?")
+    db.append_message("s1", role="assistant", content="midway")
+    # Tail: more empty assistants interleaved with prose closer
+    for _ in range(3):
+        db.append_message("s1", role="assistant", content="")
+        db.append_message("s1", role="tool", content="poll")
+    close_id = db.append_message(
+        "s1", role="assistant", content="Done. Final summary here."
+    )
+
+    view = db.get_anchored_view("s1", mid_id, window=1, bookend=3)
+
+    # bookend_start should contain prose user/assistant, never empty content
+    assert all(m["content"] for m in view["bookend_start"]), \
+        "bookend_start leaked an empty-content row"
+    # First message must be the actual opener
+    assert view["bookend_start"][0]["id"] == open_id
+
+    # bookend_end likewise — and the closer prose must appear
+    assert all(m["content"] for m in view["bookend_end"]), \
+        "bookend_end leaked an empty-content row"
+    assert any(m["id"] == close_id for m in view["bookend_end"]), \
+        "actual session closer must survive into bookend_end"
+

@@ -1744,8 +1744,13 @@ class SessionDB:
         window_max_id = window_rows[-1]["id"]
 
         # Fetch bookends only if there's space outside the window. The SQL
-        # filters by id range + role so we don't pull tool blobs we'd just
-        # drop. ``bookend=0`` short-circuits both queries.
+        # filters by id range + role + non-empty content so we don't pull
+        # tool blobs we'd just drop, and so tool-call-only assistant turns
+        # (content='' with tool_calls populated) don't crowd out the actual
+        # prose openings/closings. Bookends exist to surface the session's
+        # spoken goal + resolution; "let me check..."-shaped assistant
+        # messages without content carry signal in tool_calls but aren't
+        # useful here. ``bookend=0`` short-circuits both queries.
         bookend_start_rows: List[Any] = []
         bookend_end_rows: List[Any] = []
         if bookend > 0:
@@ -1760,6 +1765,7 @@ class SessionDB:
                 bookend_start_rows = self._conn.execute(
                     f"SELECT * FROM messages "
                     f"WHERE session_id = ? AND id < ?{role_clause} "
+                    f"AND length(content) > 0 "
                     f"ORDER BY id ASC LIMIT ?",
                     (session_id, window_min_id, *role_params, bookend),
                 ).fetchall()
@@ -1767,6 +1773,7 @@ class SessionDB:
                 bookend_end_rows = self._conn.execute(
                     f"SELECT * FROM messages "
                     f"WHERE session_id = ? AND id > ?{role_clause} "
+                    f"AND length(content) > 0 "
                     f"ORDER BY id DESC LIMIT ?",
                     (session_id, window_max_id, *role_params, bookend),
                 ).fetchall()
