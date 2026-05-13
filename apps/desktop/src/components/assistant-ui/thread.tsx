@@ -95,6 +95,10 @@ function messageContentText(content: unknown): string {
   return Array.isArray(content) ? content.map(partText).join('').trim() : ''
 }
 
+const INTERRUPTED_ONLY_RE = /^_?\[interrupted\]_?$/i
+
+const isInterruptedOnlyMessage = (text: string) => INTERRUPTED_ONLY_RE.test(text.trim())
+
 function resetStickyState(state: StickyStateFlags) {
   state.escapedFromLock = false
   state.isAtBottom = true
@@ -368,6 +372,7 @@ const AssistantMessage: FC<{ onBranchInNewChat?: (messageId: string) => void }> 
 
   const messageStatus = useAuiState(s => s.message.status?.type)
   const isPlaceholder = messageStatus === 'running' && content.length === 0
+  const interruptedOnly = useMemo(() => isInterruptedOnlyMessage(messageText), [messageText])
 
   if (isPlaceholder) {
     return null
@@ -380,7 +385,10 @@ const AssistantMessage: FC<{ onBranchInNewChat?: (messageId: string) => void }> 
       data-slot="aui_assistant-message-root"
     >
       <div
-        className="wrap-anywhere min-w-0 max-w-full overflow-hidden text-pretty text-base leading-(--dt-line-height) text-foreground"
+        className={cn(
+          'wrap-anywhere min-w-0 max-w-full overflow-hidden text-pretty text-base leading-(--dt-line-height) text-foreground',
+          interruptedOnly && 'text-[0.8rem] leading-5 text-muted-foreground/82'
+        )}
         data-slot="aui_assistant-message-content"
       >
         {hoistedTodos.length > 0 && <HoistedTodoPanel todos={hoistedTodos} />}
@@ -401,7 +409,7 @@ const AssistantMessage: FC<{ onBranchInNewChat?: (messageId: string) => void }> 
           </ErrorPrimitive.Root>
         </MessagePrimitive.Error>
       </div>
-      {messageText.trim().length > 0 && (
+      {messageText.trim().length > 0 && !interruptedOnly && (
         <AssistantFooter messageId={messageId} messageText={messageText} onBranchInNewChat={onBranchInNewChat} />
       )}
     </MessagePrimitive.Root>

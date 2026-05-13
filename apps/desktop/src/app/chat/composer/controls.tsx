@@ -1,6 +1,6 @@
 import { Button } from '@/components/ui/button'
 import { triggerHaptic } from '@/lib/haptics'
-import { ArrowUp, AudioLines, Loader2, Mic, MicOff, Square } from '@/lib/icons'
+import { ArrowUp, AudioLines, Layers3, Loader2, Mic, MicOff, Square } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 
 import type { ConversationStatus } from './hooks/use-voice-conversation'
@@ -31,6 +31,7 @@ interface ConversationProps {
 
 export function ComposerControls({
   busy,
+  busyAction,
   canSubmit,
   conversation,
   disabled,
@@ -40,6 +41,7 @@ export function ComposerControls({
   onDictate
 }: {
   busy: boolean
+  busyAction: 'queue' | 'stop'
   canSubmit: boolean
   conversation: ConversationProps
   disabled: boolean
@@ -74,12 +76,21 @@ export function ComposerControls({
         </Button>
       ) : (
         <Button
-          aria-label={busy ? 'Stop' : 'Send'}
+          aria-label={busy ? (busyAction === 'queue' ? 'Queue message' : 'Stop') : 'Send'}
           className={PRIMARY_ICON_BTN}
           disabled={disabled || !canSubmit}
+          title={busy ? (busyAction === 'queue' ? 'Queue message' : 'Stop') : 'Send'}
           type="submit"
         >
-          {busy ? <span className="block size-3 rounded-[0.1875rem] bg-current" /> : <ArrowUp size={18} />}
+          {busy ? (
+            busyAction === 'queue' ? (
+              <Layers3 size={16} />
+            ) : (
+              <span className="block size-3 rounded-[0.1875rem] bg-current" />
+            )
+          ) : (
+            <ArrowUp size={18} />
+          )}
         </Button>
       )}
     </div>

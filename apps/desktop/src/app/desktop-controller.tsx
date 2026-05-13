@@ -470,7 +470,7 @@ export function DesktopController() {
       onAttachDroppedItems={composer.attachDroppedItems}
       onAttachImageBlob={composer.attachImageBlob}
       onBranchInNewChat={messageId => void branchInNewChat(messageId)}
-      onCancel={() => void cancelRun()}
+      onCancel={cancelRun}
       onDeleteSelectedSession={() => {
         if (selectedStoredSessionId) {
           void removeSession(selectedStoredSessionId)
