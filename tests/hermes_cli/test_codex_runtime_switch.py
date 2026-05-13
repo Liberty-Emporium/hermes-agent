@@ -192,3 +192,31 @@ class TestApply:
         assert r.new_value == "codex_app_server"
         assert "MCP migration skipped" in r.message
         assert "disk full" in r.message
+
+    def test_binary_check_cached_within_apply(self):
+        """check_codex_binary_ok is invoked at most once per apply() call.
+
+        The enable path has three sites that need the version (state report,
+        enable gate, success message). Without caching, a single
+        /codex-runtime invocation spawns `codex --version` three times.
+        Regression guard against a refactor that drops the cache.
+        """
+        cfg = {}
+        with patch.object(crs, "check_codex_binary_ok",
+                          return_value=(True, "0.130.0")) as bin_check, \
+             patch("hermes_cli.codex_runtime_plugin_migration.migrate"):
+            r = crs.apply(cfg, "codex_app_server")
+        assert r.success
+        assert bin_check.call_count == 1, (
+            f"check_codex_binary_ok was called {bin_check.call_count} time(s); "
+            "should be cached and called exactly once per apply()"
+        )
+
+    def test_binary_check_cached_on_read_only_call(self):
+        """Read-only call (new_value=None) calls the binary check exactly
+        once and reuses the result for the message."""
+        cfg = {"model": {"openai_runtime": "codex_app_server"}}
+        with patch.object(crs, "check_codex_binary_ok",
+                          return_value=(True, "0.130.0")) as bin_check:
+            crs.apply(cfg, None)
+        assert bin_check.call_count == 1

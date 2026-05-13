@@ -116,9 +116,21 @@ def apply(
     """
     current = get_current_runtime(config)
 
+    # Cache the codex binary check for this apply() call. Subprocess spawn
+    # is cheap (~50ms for `codex --version`), but we'd otherwise call it up
+    # to 3 times in the enable path (read-only/state, gate, success message).
+    # None = not yet checked; (bool, str) = result.
+    _binary_check: Optional[tuple[bool, Optional[str]]] = None
+
+    def _check_binary_cached() -> tuple[bool, Optional[str]]:
+        nonlocal _binary_check
+        if _binary_check is None:
+            _binary_check = check_codex_binary_ok()
+        return _binary_check
+
     # Read-only call: just report state
     if new_value is None:
-        ok, ver = check_codex_binary_ok()
+        ok, ver = _check_binary_cached()
         msg = (
             f"openai_runtime: {current}\n"
             f"codex CLI: {'OK ' + ver if ok else 'not available — ' + (ver or 'install with `npm i -g @openai/codex`')}"
@@ -145,7 +157,7 @@ def apply(
     # an opt-in toggle that silently fails on the first turn is the
     # worst possible UX. Block here with a clear install hint.
     if new_value == "codex_app_server":
-        ok, ver_or_msg = check_codex_binary_ok()
+        ok, ver_or_msg = _check_binary_cached()
         if not ok:
             return CodexRuntimeStatus(
                 success=False,
@@ -177,7 +189,7 @@ def apply(
         f"openai_runtime: {current} → {new_value}",
     ]
     if new_value == "codex_app_server":
-        ok, ver = check_codex_binary_ok()
+        ok, ver = _check_binary_cached()
         if ok:
             msg_lines.append(f"codex CLI: {ver}")
         # Auto-migrate Hermes' MCP servers into ~/.codex/config.toml so
