@@ -63,19 +63,13 @@ logger = logging.getLogger(__name__)
 
 VIDEO_GENERATE_SCHEMA: Dict[str, Any] = {
     "name": "video_generate",
-    "description": (
-        "Generate, edit, or extend a video using the user's configured video "
-        "generation backend. One unified tool covers text-to-video "
-        "(prompt only), image-to-video (prompt + image_url), video edit "
-        "(prompt + video_url, operation='edit'), and video extension "
-        "(video_url, operation='extend'). Returns either an HTTP URL or an "
-        "absolute file path in the `video` field; display it with markdown "
-        "![description](url-or-path) and the gateway will deliver it. The "
-        "backend and model are user-configured via `hermes tools` → Video "
-        "Generation; the agent does not pick them. Long-running generations "
-        "may take 30 seconds to several minutes — the call blocks until the "
-        "video is ready or the provider's timeout elapses."
-    ),
+    # Placeholder — the real description is built dynamically at
+    # get_tool_definitions() time so it reflects the active backend's
+    # actual capabilities (which operations / modalities / resolutions /
+    # duration ranges the user's currently-selected model supports).
+    # See _build_dynamic_video_schema() below and the dynamic-tool-schemas
+    # skill at github/hermes-agent-dev/references/dynamic-tool-schemas.md.
+    "description": "(rebuilt at get_definitions() time — see _build_dynamic_video_schema)",
     "parameters": {
         "type": "object",
         "properties": {
@@ -443,6 +437,162 @@ def _handle_video_generate(args: Dict[str, Any], **_kw: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Dynamic schema — reflect the active backend's actual capabilities
+# ---------------------------------------------------------------------------
+#
+# Why dynamic: the user's configured backend determines which operations
+# (generate/edit/extend), modalities (text / image / refs), aspect ratios,
+# resolutions, durations, and audio/negative-prompt flags are real. A model
+# that calls video_generate without knowing the active backend wastes a
+# turn on something like "fal-ai/veo3.1/image-to-video requires image_url".
+# Surfacing the per-model surface in the description means the model
+# usually gets the call right on the first try.
+#
+# Memoization: model_tools.get_tool_definitions() keys its cache on
+# config.yaml mtime, so when the user changes provider/model via
+# `hermes tools` or `/skills`, the schema rebuilds automatically.
+
+
+_GENERIC_DESCRIPTION = (
+    "Generate, edit, or extend a video using the user's configured video "
+    "generation backend. One unified tool covers text-to-video, "
+    "image-to-video, video edit, and video extend; which of these the "
+    "active backend supports is described below. The backend and model "
+    "are user-configured via `hermes tools` → Video Generation; the agent "
+    "does not pick them. Long-running generations may take 30 seconds to "
+    "several minutes — the call blocks until the video is ready or the "
+    "provider's timeout elapses. Returns either an HTTP URL or an "
+    "absolute file path in the `video` field; display it with markdown "
+    "![description](url-or-path) and the gateway will deliver it."
+)
+
+
+def _format_model_caveats(model_meta: Dict[str, Any]) -> List[str]:
+    """Pull human-readable caveats out of one model's catalog metadata."""
+    caveats: List[str] = []
+
+    modalities = model_meta.get("modalities") or []
+    modality = model_meta.get("modality")  # FAL's plugin uses this key
+
+    if "image" in modalities and "text" not in modalities:
+        caveats.append(
+            "image-to-video only — image_url is REQUIRED; "
+            "text-only prompts will be rejected"
+        )
+    elif modality == "image":
+        caveats.append(
+            "image-to-video only — image_url is REQUIRED; "
+            "text-only prompts will be rejected"
+        )
+    elif modality == "text":
+        caveats.append("text-to-video only — image_url is not supported")
+
+    ops = model_meta.get("operations") or []
+    if ops and set(ops) != {"generate"}:
+        caveats.append(f"operations supported by this model: {', '.join(sorted(ops))}")
+
+    return caveats
+
+
+def _build_dynamic_video_schema() -> Dict[str, Any]:
+    """Build a description that reflects the active backend's actual surface.
+
+    Cheap: reads config (already memoized by the caller), asks the active
+    provider for `capabilities()` and the active model's catalog entry,
+    and formats a few lines of prose. Falls back to the generic
+    description when no provider is configured or registered.
+    """
+    parts: List[str] = [_GENERIC_DESCRIPTION]
+
+    configured = _read_configured_video_provider()
+    configured_model = _read_configured_video_model()
+
+    if not configured:
+        parts.append(
+            "\nNo video backend is configured. Calls will return an error "
+            "until the user picks one via `hermes tools` → Video Generation."
+        )
+        return {"description": "\n".join(parts)}
+
+    try:
+        from agent.video_gen_registry import get_provider
+        from hermes_cli.plugins import _ensure_plugins_discovered
+
+        _ensure_plugins_discovered()
+        provider = get_provider(configured)
+    except Exception:
+        provider = None
+
+    if provider is None:
+        parts.append(
+            f"\nActive backend: {configured} (plugin not yet loaded — the "
+            f"tool will retry discovery on first call)."
+        )
+        return {"description": "\n".join(parts)}
+
+    try:
+        caps = provider.capabilities() or {}
+    except Exception:
+        caps = {}
+    try:
+        models = provider.list_models() or []
+    except Exception:
+        models = []
+
+    active_model = configured_model or provider.default_model()
+    model_meta = next(
+        (m for m in models if isinstance(m, dict) and m.get("id") == active_model),
+        {},
+    )
+
+    backend_label = provider.display_name
+    line = f"\nActive backend: {backend_label}"
+    if active_model:
+        line += f" · model: {active_model}"
+    parts.append(line)
+
+    # Model-specific caveats — the high-signal stuff that prevents wasted turns
+    caveats = _format_model_caveats(model_meta)
+    for c in caveats:
+        parts.append(f"- {c}")
+
+    # Backend-wide capability summary (covers the cross-cutting flags)
+    ops = caps.get("operations") or ["generate"]
+    parts.append(f"- operations supported by this backend: {', '.join(sorted(ops))}")
+
+    modalities = caps.get("modalities") or ["text"]
+    parts.append(f"- modalities supported by this backend: {', '.join(sorted(modalities))}")
+
+    if caps.get("aspect_ratios"):
+        parts.append(f"- aspect_ratio choices: {', '.join(caps['aspect_ratios'])}")
+    if caps.get("resolutions"):
+        parts.append(f"- resolution choices: {', '.join(caps['resolutions'])}")
+    if caps.get("min_duration") and caps.get("max_duration"):
+        parts.append(
+            f"- duration range: {caps['min_duration']}-{caps['max_duration']}s"
+        )
+    if caps.get("supports_audio"):
+        parts.append("- audio: pass `audio=true` to enable native audio (pricing tier)")
+    if caps.get("supports_negative_prompt"):
+        parts.append("- negative_prompt: supported")
+    max_refs = caps.get("max_reference_images") or 0
+    if max_refs:
+        parts.append(f"- reference_image_urls: up to {max_refs} images")
+
+    # Cross-backend guidance: when the user wants something this backend
+    # can't do, tell the model how to escalate gracefully.
+    missing_ops = {"generate", "edit", "extend"} - set(ops)
+    if missing_ops:
+        parts.append(
+            f"- not supported on this backend: {', '.join(sorted(missing_ops))}. "
+            f"If the user asks for one of these, surface that they need to "
+            f"switch backends via `hermes tools` → Video Generation."
+        )
+
+    return {"description": "\n".join(parts)}
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -456,4 +606,5 @@ registry.register(
     requires_env=[],
     is_async=False,
     emoji="🎬",
+    dynamic_schema_overrides=_build_dynamic_video_schema,
 )
