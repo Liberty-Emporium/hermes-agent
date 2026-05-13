@@ -136,8 +136,13 @@ describe('preprocessMarkdown', () => {
     const output = preprocessMarkdown(input)
 
     expect(output).not.toContain('```')
+    // Currency dollar amounts get escaped to `\$` in the preprocessor
+    // so they don't get parsed as math delimiters by remark-math (we
+    // enable singleDollarTextMath, which would otherwise greedy-match
+    // `$56...$99` as one big inline math span). The escape is invisible
+    // to the user — `\$` renders as a literal `$` in the final output.
     expect(output).toContain(
-      '~$56<https://www.getyourguide.com/san-juan-puerto-rico-l355/san-juan-snorkel-sea-turtles-manatees-free-video-rum-t879147/> Old San Juan Sunset Cruise'
+      '~\\$56<https://www.getyourguide.com/san-juan-puerto-rico-l355/san-juan-snorkel-sea-turtles-manatees-free-video-rum-t879147/> Old San Juan Sunset Cruise'
     )
     expect(output).toContain(
       '<https://www.getyourguide.com/en-gb/san-juan-puerto-rico-l355/san-juan-old-san-juan-sunset-cruise-with-drinks-transfer-t405191/>'

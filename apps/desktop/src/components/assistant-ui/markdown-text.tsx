@@ -335,7 +335,15 @@ const MarkdownTextImpl = () => {
       )}
       lineNumbers={false}
       mode="streaming"
-      parseIncompleteMarkdown={!isStreaming}
+      // Always auto-close incomplete fences — even during streaming.
+      // Without this, an unclosed ```python ... ``` whose body contains
+      // `$` (very common: shell snippets, JS template strings, dollar
+      // amounts) leaks those dollars out to the math parser and they
+      // get rendered as broken inline math until the closing fence
+      // arrives. Shiki is independently deferred via `defer={isStreaming}`
+      // on the SyntaxHighlighter component, so we don't pay code-block
+      // tokenization on every token even with this set.
+      parseIncompleteMarkdown
       plugins={{ math: mathPlugin, ...(isStreaming ? {} : { code }) }}
       preprocess={preprocessMarkdown}
       shikiTheme={['github-light-default', 'github-dark-default']}
