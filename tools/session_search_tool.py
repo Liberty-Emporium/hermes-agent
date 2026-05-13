@@ -250,8 +250,16 @@ def _truncate_around_matches(
 
 async def _summarize_session(
     conversation_text: str, query: str, session_meta: Dict[str, Any]
-) -> Optional[str]:
-    """Summarize a single session conversation focused on the search query."""
+) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Summarize a single session conversation focused on the search query.
+
+    Returns ``(content, usage)`` where ``usage`` is a dict with
+    ``{model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens}``
+    parsed from the aux LLM response, or ``None`` when the model didn't surface
+    usage data. The usage dict lets callers attribute the cost of summary-mode
+    aux calls back to the parent session — without this, summary-mode spend is
+    invisible to per-session accounting.
+    """
     system_prompt = (
         "You are reviewing a past conversation transcript to help recall what happened. "
         "Summarize the conversation with a focus on the search topic. Include:\n"
@@ -288,17 +296,18 @@ async def _summarize_session(
                 max_tokens=MAX_SUMMARY_TOKENS,
             )
             content = extract_content_or_reasoning(response)
+            usage = _extract_aux_usage(response)
             if content:
-                return content
+                return content, usage
             # Reasoning-only / empty — let the retry loop handle it
             logging.warning("Session search LLM returned empty content (attempt %d/%d)", attempt + 1, max_retries)
             if attempt < max_retries - 1:
                 await asyncio.sleep(1 * (attempt + 1))
                 continue
-            return content
+            return content, usage
         except RuntimeError:
             logging.warning("No auxiliary model available for session summarization")
-            return None
+            return None, None
         except Exception as e:
             if attempt < max_retries - 1:
                 await asyncio.sleep(1 * (attempt + 1))
@@ -309,7 +318,48 @@ async def _summarize_session(
                     e,
                     exc_info=True,
                 )
-                return None
+                return None, None
+
+
+def _extract_aux_usage(response: Any) -> Optional[Dict[str, Any]]:
+    """Pull usage data off an aux LLM response, normalising provider variants.
+
+    Returns ``None`` when the response carries no usage info (test mocks,
+    providers that don't surface it). Returns a dict with the fields we care
+    about for cost attribution otherwise. Reads both OpenAI-style
+    (``prompt_tokens``/``completion_tokens``) and Anthropic-style
+    (``input_tokens``/``output_tokens``) usage shapes.
+    """
+    usage = getattr(response, "usage", None)
+    if not usage:
+        return None
+    # Provider variants — read whichever is populated.
+    input_tokens = (
+        getattr(usage, "input_tokens", None)
+        or getattr(usage, "prompt_tokens", None)
+        or 0
+    )
+    output_tokens = (
+        getattr(usage, "output_tokens", None)
+        or getattr(usage, "completion_tokens", None)
+        or 0
+    )
+    # Anthropic prompt-caching fields.
+    cache_read = getattr(usage, "cache_read_input_tokens", None) or 0
+    cache_create = getattr(usage, "cache_creation_input_tokens", None) or 0
+    # OpenAI-style cached tokens may live under prompt_tokens_details.
+    if not cache_read:
+        details = getattr(usage, "prompt_tokens_details", None)
+        if details:
+            cache_read = getattr(details, "cached_tokens", 0) or 0
+    model = getattr(response, "model", None)
+    return {
+        "model": model,
+        "input_tokens": int(input_tokens or 0),
+        "output_tokens": int(output_tokens or 0),
+        "cache_read_tokens": int(cache_read or 0),
+        "cache_creation_tokens": int(cache_create or 0),
+    }
 
 
 # Sources that are excluded from session browsing/searching by default.
@@ -934,12 +984,12 @@ def session_search(
                 )
 
         # Summarize all sessions in parallel
-        async def _summarize_all() -> List[Union[str, Exception]]:
+        async def _summarize_all() -> List[Union[tuple, Exception]]:
             """Summarize all sessions with bounded concurrency."""
             max_concurrency = min(_get_session_search_max_concurrency(), max(1, len(tasks)))
             semaphore = asyncio.Semaphore(max_concurrency)
 
-            async def _bounded_summary(text: str, meta: Dict[str, Any]) -> Optional[str]:
+            async def _bounded_summary(text: str, meta: Dict[str, Any]):
                 async with semaphore:
                     return await _summarize_session(text, query, meta)
 
@@ -969,13 +1019,27 @@ def session_search(
             }, ensure_ascii=False)
 
         summaries = []
+        aux_total = {
+            "model": None,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "call_count": 0,
+        }
         for (session_id, match_info, conversation_text, session_meta), result in zip(tasks, results):
+            usage: Optional[Dict[str, Any]] = None
             if isinstance(result, Exception):
                 logging.warning(
                     "Failed to summarize session %s: %s",
                     session_id, result, exc_info=True,
                 )
-                result = None
+                summary_text = None
+            elif isinstance(result, tuple):
+                summary_text, usage = result
+            else:
+                # Defensive: a future code path might still return a bare string.
+                summary_text, usage = result, None
 
             # Prefer resolved parent session metadata over FTS5 match metadata.
             # match_info carries source/model from the *child* session that contained
@@ -991,24 +1055,39 @@ def session_search(
                 "model": session_meta.get("model") or match_info.get("model"),
             }
 
-            if result:
-                entry["summary"] = result
+            if summary_text:
+                entry["summary"] = summary_text
             else:
                 # Fallback: raw preview so matched sessions aren't silently
                 # dropped when the summarizer is unavailable (fixes #3409).
                 preview = (conversation_text[:500] + "\n…[truncated]") if conversation_text else "No preview available."
                 entry["summary"] = f"[Raw preview — summarization unavailable]\n{preview}"
 
+            if usage:
+                entry["aux_usage"] = usage
+                aux_total["model"] = aux_total["model"] or usage.get("model")
+                aux_total["input_tokens"] += usage["input_tokens"]
+                aux_total["output_tokens"] += usage["output_tokens"]
+                aux_total["cache_read_tokens"] += usage["cache_read_tokens"]
+                aux_total["cache_creation_tokens"] += usage["cache_creation_tokens"]
+                aux_total["call_count"] += 1
+
             summaries.append(entry)
 
-        return json.dumps({
+        payload = {
             "success": True,
             "mode": "summary",
             "query": query,
             "results": summaries,
             "count": len(summaries),
             "sessions_searched": len(seen_sessions),
-        }, ensure_ascii=False)
+        }
+        # Only surface aux_usage_total when we actually captured any (test mocks
+        # and providers that don't report usage produce an all-zero/empty dict —
+        # don't pollute the payload in that case).
+        if aux_total["call_count"]:
+            payload["aux_usage_total"] = aux_total
+        return json.dumps(payload, ensure_ascii=False)
 
     except Exception as e:
         logging.error("Session search failed: %s", e, exc_info=True)

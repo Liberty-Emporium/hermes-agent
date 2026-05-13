@@ -212,7 +212,7 @@ class TestSessionSearchConcurrency:
             max_seen["value"] = max(max_seen["value"], active["value"])
             await asyncio.sleep(0.01)
             active["value"] -= 1
-            return "summary"
+            return "summary", None
 
         monkeypatch.setattr("tools.session_search_tool._summarize_session", fake_summarize)
         monkeypatch.setattr("model_tools._run_async", lambda coro: asyncio.run(coro))
@@ -409,7 +409,7 @@ class TestSessionSearch:
         async def fake_summarize(text, query, meta):
             assert "full transcript about session_search" in text
             assert query == "session_search"
-            return "focused default summary"
+            return "focused default summary", None
 
         monkeypatch.setattr("tools.session_search_tool._summarize_session", fake_summarize)
         monkeypatch.setattr("model_tools._run_async", lambda coro: asyncio.run(coro))
@@ -526,7 +526,7 @@ class TestSessionSearch:
         from tools.session_search_tool import session_search
 
         async def fake_summarize(_text, _query, _meta):
-            return "alias summary"
+            return "alias summary", None
 
         monkeypatch.setattr("tools.session_search_tool._summarize_session", fake_summarize)
         monkeypatch.setattr("model_tools._run_async", lambda coro: asyncio.run(coro))
@@ -551,7 +551,7 @@ class TestSessionSearch:
         from tools.session_search_tool import session_search
 
         async def fake_summarize(_text, _query, _meta):
-            return "fallback summary"
+            return "fallback summary", None
 
         monkeypatch.setattr("tools.session_search_tool._summarize_session", fake_summarize)
         monkeypatch.setattr("model_tools._run_async", lambda coro: asyncio.run(coro))
@@ -597,7 +597,7 @@ class TestSessionSearch:
             assert "full transcript" in text
             assert query == "session_search"
             assert meta["source"] == "cli"
-            return "focused session summary"
+            return "focused session summary", None
 
         monkeypatch.setattr("tools.session_search_tool._summarize_session", fake_summarize)
         monkeypatch.setattr("model_tools._run_async", lambda coro: asyncio.run(coro))
@@ -617,6 +617,89 @@ class TestSessionSearch:
         assert result["mode"] == "summary"
         assert result["results"][0]["summary"] == "focused session summary"
         mock_db.get_messages_as_conversation.assert_called_once_with("other_sid")
+
+    def test_summary_mode_surfaces_aux_usage_for_cost_attribution(self, monkeypatch):
+        """Summary-mode aux LLM usage must flow back into the tool payload.
+
+        Without this, summary-mode spend is invisible to the parent session's
+        per-session token / cost accounting — the aux LLM call (up to 28K input
+        + 10K output per session summarised, at the same Opus rate as the main
+        loop) gets swallowed silently. The tool surfaces it via per-result
+        ``aux_usage`` and a top-level ``aux_usage_total`` so callers can
+        attribute the real cost.
+        """
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        async def fake_summarize(_text, _query, _meta):
+            # Match the new (content, usage) signature.
+            return "summary", {
+                "model": "anthropic/claude-opus-4-7",
+                "input_tokens": 27_500,
+                "output_tokens": 8_200,
+                "cache_read_tokens": 0,
+                "cache_creation_tokens": 0,
+            }
+
+        monkeypatch.setattr("tools.session_search_tool._summarize_session", fake_summarize)
+        monkeypatch.setattr("model_tools._run_async", lambda coro: asyncio.run(coro))
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {"session_id": "s1", "source": "cli", "session_started": 1709500000, "model": "test"},
+            {"session_id": "s2", "source": "cli", "session_started": 1709500001, "model": "test"},
+        ]
+        mock_db.get_session.return_value = {"parent_session_id": None, "source": "cli"}
+        mock_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "transcript"},
+        ]
+
+        result = json.loads(session_search(query="session_search", db=mock_db, mode="summary"))
+
+        assert result["success"] is True
+        # Per-result usage attached.
+        assert result["results"][0]["aux_usage"]["input_tokens"] == 27_500
+        assert result["results"][0]["aux_usage"]["output_tokens"] == 8_200
+        # Top-level aggregate summed across summarised sessions.
+        total = result["aux_usage_total"]
+        assert total["call_count"] == 2
+        assert total["input_tokens"] == 55_000
+        assert total["output_tokens"] == 16_400
+        assert total["model"] == "anthropic/claude-opus-4-7"
+
+    def test_summary_mode_omits_aux_usage_total_when_provider_returns_no_usage(self, monkeypatch):
+        """Test mocks and providers that don't surface usage shouldn't pollute the payload.
+
+        If every summary call returned ``usage=None``, the aggregator never
+        increments ``call_count``, and we deliberately omit ``aux_usage_total``
+        from the response so downstream consumers can detect "no data" cleanly
+        rather than seeing a misleading all-zeros block.
+        """
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        async def fake_summarize_no_usage(_text, _query, _meta):
+            return "summary", None
+
+        monkeypatch.setattr(
+            "tools.session_search_tool._summarize_session", fake_summarize_no_usage
+        )
+        monkeypatch.setattr("model_tools._run_async", lambda coro: asyncio.run(coro))
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {"session_id": "s1", "source": "cli", "session_started": 1709500000, "model": "test"},
+        ]
+        mock_db.get_session.return_value = {"parent_session_id": None, "source": "cli"}
+        mock_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "transcript"},
+        ]
+
+        result = json.loads(session_search(query="x", db=mock_db, mode="summary"))
+
+        assert result["success"] is True
+        assert "aux_usage_total" not in result
+        assert "aux_usage" not in result["results"][0]
 
     def test_positional_db_argument_remains_backwards_compatible(self):
         """Keep the historical positional order: query, role_filter, limit, db, current_session_id."""
