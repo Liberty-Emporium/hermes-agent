@@ -6,11 +6,10 @@ export const TITLEBAR_ICON_SIZE = 12
 export const TITLEBAR_CONTROL_OFFSET_X = 60
 export const TITLEBAR_CONTROL_HEIGHT = 22
 export const TITLEBAR_CONTROLS_TOP = (TITLEBAR_HEIGHT - TITLEBAR_CONTROL_HEIGHT) / 2
-
-const WINDOW_BUTTON_FALLBACK = {
-  x: 24,
-  y: TITLEBAR_HEIGHT / 2 - MACOS_TRAFFIC_LIGHTS_HEIGHT / 2
-}
+// Edge inset used when no left-side native controls take up that space —
+// Windows/Linux (native overlay is on the right) and macOS fullscreen
+// (traffic lights are hidden). Matches the right-cluster's 0.75rem padding.
+export const TITLEBAR_EDGE_INSET = 14
 
 export const titlebarButtonClass =
   'h-[var(--titlebar-control-height)] w-[var(--titlebar-control-size)] rounded-md text-muted-foreground hover:bg-accent hover:text-foreground'
@@ -27,10 +26,13 @@ export function titlebarControlsPosition(
 ) {
   const top = Math.max(0, TITLEBAR_CONTROLS_TOP)
 
-  // macOS hides traffic lights in fullscreen — pin to the edge instead of reserving their slot.
-  if (windowButtonPosition && isFullscreen) {
-    return { left: 14, top }
+  // No left-side native controls to dodge:
+  //   - Windows/Linux: native min/max/close render on the right via titleBarOverlay.
+  //   - macOS fullscreen: traffic lights are hidden.
+  // In both cases, pin the cluster to the edge with a small inset.
+  if (!windowButtonPosition || isFullscreen) {
+    return { left: TITLEBAR_EDGE_INSET, top }
   }
 
-  return { left: (windowButtonPosition ?? WINDOW_BUTTON_FALLBACK).x + TITLEBAR_CONTROL_OFFSET_X, top }
+  return { left: windowButtonPosition.x + TITLEBAR_CONTROL_OFFSET_X, top }
 }

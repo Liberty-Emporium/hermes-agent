@@ -14,7 +14,7 @@ import {
 } from '@/components/ui/sidebar'
 import { Skeleton } from '@/components/ui/skeleton'
 import type { SessionInfo } from '@/hermes'
-import { Brain, ChevronDown, Layers3, MessageCircle, Plus, RefreshCw } from '@/lib/icons'
+import { Brain, ChevronDown, Clock, Layers3, MessageCircle, Plus, RefreshCw, Users } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import {
   $pinnedSessionIds,
@@ -28,7 +28,14 @@ import {
 } from '@/store/layout'
 import { $selectedStoredSessionId, $sessions, $sessionsLoading, $workingSessionIds } from '@/store/session'
 
-import { type AppView, ARTIFACTS_ROUTE, MESSAGING_ROUTE, SKILLS_ROUTE } from '../../routes'
+import {
+  type AppView,
+  ARTIFACTS_ROUTE,
+  CRON_ROUTE,
+  MESSAGING_ROUTE,
+  PROFILES_ROUTE,
+  SKILLS_ROUTE
+} from '../../routes'
 import { SidebarPanelLabel } from '../../shell/sidebar-label'
 import type { SidebarNavItem } from '../../types'
 
@@ -43,7 +50,9 @@ const SIDEBAR_NAV: SidebarNavItem[] = [
   },
   { id: 'skills', label: 'Skills', icon: Brain, route: SKILLS_ROUTE },
   { id: 'messaging', label: 'Messaging', icon: MessageCircle, route: MESSAGING_ROUTE },
-  { id: 'artifacts', label: 'Artifacts', icon: Layers3, route: ARTIFACTS_ROUTE }
+  { id: 'artifacts', label: 'Artifacts', icon: Layers3, route: ARTIFACTS_ROUTE },
+  { id: 'cron', label: 'Cron', icon: Clock, route: CRON_ROUTE },
+  { id: 'profiles', label: 'Profiles', icon: Users, route: PROFILES_ROUTE }
 ]
 
 interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
@@ -117,7 +126,9 @@ export function ChatSidebar({
                 const active =
                   (item.id === 'skills' && currentView === 'skills') ||
                   (item.id === 'messaging' && currentView === 'messaging') ||
-                  (item.id === 'artifacts' && currentView === 'artifacts')
+                  (item.id === 'artifacts' && currentView === 'artifacts') ||
+                  (item.id === 'cron' && currentView === 'cron') ||
+                  (item.id === 'profiles' && currentView === 'profiles')
 
                 return (
                   <SidebarMenuItem key={item.id}>

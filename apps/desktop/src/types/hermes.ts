@@ -295,6 +295,130 @@ export interface UsageStats {
   total: number
 }
 
+export interface AnalyticsDailyEntry {
+  actual_cost: number
+  api_calls: number
+  cache_read_tokens: number
+  day: string
+  estimated_cost: number
+  input_tokens: number
+  output_tokens: number
+  reasoning_tokens: number
+  sessions: number
+}
+
+export interface AnalyticsModelEntry {
+  api_calls: number
+  estimated_cost: number
+  input_tokens: number
+  model: string
+  output_tokens: number
+  sessions: number
+}
+
+export interface AnalyticsResponse {
+  by_model: AnalyticsModelEntry[]
+  daily: AnalyticsDailyEntry[]
+  period_days: number
+  skills: {
+    summary: AnalyticsSkillsSummary
+    top_skills: AnalyticsSkillEntry[]
+  }
+  totals: AnalyticsTotals
+}
+
+export interface AnalyticsSkillEntry {
+  last_used_at: null | number
+  manage_count: number
+  percentage: number
+  skill: string
+  total_count: number
+  view_count: number
+}
+
+export interface AnalyticsSkillsSummary {
+  distinct_skills_used: number
+  total_skill_actions: number
+  total_skill_edits: number
+  total_skill_loads: number
+}
+
+export interface AnalyticsTotals {
+  total_actual_cost: number
+  total_api_calls: number
+  total_cache_read: number
+  total_estimated_cost: number
+  total_input: number
+  total_output: number
+  total_reasoning: number
+  total_sessions: number
+}
+
+export interface CronJob {
+  deliver?: null | string
+  enabled: boolean
+  id: string
+  last_error?: null | string
+  last_run_at?: null | string
+  name?: null | string
+  next_run_at?: null | string
+  prompt?: null | string
+  schedule?: CronJobSchedule
+  schedule_display?: null | string
+  script?: null | string
+  state?: null | string
+}
+
+export interface CronJobCreatePayload {
+  deliver?: string
+  name?: string
+  prompt: string
+  schedule: string
+}
+
+export interface CronJobSchedule {
+  display?: string
+  expr?: string
+  kind?: string
+}
+
+export interface CronJobUpdates {
+  deliver?: string
+  enabled?: boolean
+  name?: string
+  prompt?: string
+  schedule?: string
+}
+
+export interface ProfileCreatePayload {
+  clone_from_default?: boolean
+  name: string
+  no_skills?: boolean
+}
+
+export interface ProfileInfo {
+  has_env: boolean
+  is_default: boolean
+  model: null | string
+  name: string
+  path: string
+  provider: null | string
+  skill_count: number
+}
+
+export interface ProfileSetupCommand {
+  command: string
+}
+
+export interface ProfileSoul {
+  content: string
+  exists: boolean
+}
+
+export interface ProfilesResponse {
+  profiles: ProfileInfo[]
+}
+
 export interface SkillInfo {
   category: string
   description: string

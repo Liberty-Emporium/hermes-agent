@@ -103,6 +103,7 @@ export interface HermesConnection {
   baseUrl: string
   isFullscreen: boolean
   mode?: 'local' | 'remote'
+  nativeOverlayWidth: number
   source?: 'env' | 'local' | 'settings'
   token: string
   wsUrl: string
@@ -112,6 +113,7 @@ export interface HermesConnection {
 
 export interface HermesWindowState {
   isFullscreen: boolean
+  nativeOverlayWidth: number
   windowButtonPosition: { x: number; y: number } | null
 }
 

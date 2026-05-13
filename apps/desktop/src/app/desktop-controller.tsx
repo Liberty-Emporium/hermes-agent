@@ -73,7 +73,9 @@ import { UpdatesOverlay } from './updates-overlay'
 const AgentsView = lazy(async () => ({ default: (await import('./agents')).AgentsView }))
 const ArtifactsView = lazy(async () => ({ default: (await import('./artifacts')).ArtifactsView }))
 const CommandCenterView = lazy(async () => ({ default: (await import('./command-center')).CommandCenterView }))
+const CronView = lazy(async () => ({ default: (await import('./cron')).CronView }))
 const MessagingView = lazy(async () => ({ default: (await import('./messaging')).MessagingView }))
+const ProfilesView = lazy(async () => ({ default: (await import('./profiles')).ProfilesView }))
 const SettingsView = lazy(async () => ({ default: (await import('./settings')).SettingsView }))
 const SkillsView = lazy(async () => ({ default: (await import('./skills')).SkillsView }))
 
@@ -542,6 +544,25 @@ export function DesktopController() {
               </Suspense>
             }
             path="artifacts"
+          />
+          <Route
+            element={
+              <Suspense fallback={null}>
+                <CronView setStatusbarItemGroup={setStatusbarItemGroup} setTitlebarToolGroup={setTitlebarToolGroup} />
+              </Suspense>
+            }
+            path="cron"
+          />
+          <Route
+            element={
+              <Suspense fallback={null}>
+                <ProfilesView
+                  setStatusbarItemGroup={setStatusbarItemGroup}
+                  setTitlebarToolGroup={setTitlebarToolGroup}
+                />
+              </Suspense>
+            }
+            path="profiles"
           />
           <Route element={null} path="settings" />
           <Route element={null} path="command-center" />

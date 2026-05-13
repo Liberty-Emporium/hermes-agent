@@ -99,15 +99,10 @@ voice = [
   "numpy==2.4.3",
 ]
 pty = [
-<<<<<<< HEAD
   # Kept as a no-op back-compat alias — `ptyprocess` and `pywinpty` are now
   # in the main `dependencies` list (with the same platform markers), so
   # any existing `pip install hermes-agent[pty]` invocations resolve cleanly
   # without pulling in extra packages.
-=======
-  "ptyprocess==0.7.0; sys_platform != 'win32'",
-  "pywinpty==2.0.15; sys_platform == 'win32'",
->>>>>>> main
 ]
 honcho = ["honcho-ai==2.0.1"]
 mcp = ["mcp==1.26.0"]

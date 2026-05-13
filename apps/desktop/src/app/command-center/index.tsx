@@ -17,6 +17,7 @@ import {
   getGlobalModelOptions,
   getLogs,
   getStatus,
+  getUsageAnalytics,
   restartGateway,
   searchSessions,
   setModelAssignment,
@@ -24,6 +25,7 @@ import {
 } from '@/hermes'
 import type {
   ActionStatusResponse,
+  AnalyticsResponse,
   AuxiliaryModelsResponse,
   ModelOptionProvider,
   SessionInfo,
@@ -32,7 +34,7 @@ import type {
 } from '@/hermes'
 import { sessionTitle } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
-import { Activity, AlertCircle, Cpu, Pin } from '@/lib/icons'
+import { Activity, AlertCircle, BarChart3, Cpu, Pin } from '@/lib/icons'
 import { exportSession } from '@/lib/session-export'
 import { cn } from '@/lib/utils'
 import { upsertDesktopActionTask } from '@/store/activity'
@@ -46,9 +48,33 @@ import { OverlayMain, OverlayNavItem, OverlaySidebar, OverlaySplitLayout } from 
 import { OverlayView } from '../overlays/overlay-view'
 import { ARTIFACTS_ROUTE, MESSAGING_ROUTE, NEW_CHAT_ROUTE, SETTINGS_ROUTE, SKILLS_ROUTE } from '../routes'
 
-export type CommandCenterSection = 'models' | 'sessions' | 'system'
+export type CommandCenterSection = 'models' | 'sessions' | 'system' | 'usage'
 
-const SECTIONS = ['sessions', 'system', 'models'] as const satisfies readonly CommandCenterSection[]
+const SECTIONS = ['sessions', 'system', 'models', 'usage'] as const satisfies readonly CommandCenterSection[]
+
+// Mirrors `_AUX_TASK_SLOTS` in hermes_cli/web_server.py. Friendly labels and
+// hints make the assignments panel readable; raw task keys (vision, mcp, …)
+// are opaque to most users.
+interface AuxTaskMeta {
+  hint: string
+  key: string
+  label: string
+}
+
+const AUX_TASKS: readonly AuxTaskMeta[] = [
+  { key: 'vision', label: 'Vision', hint: 'Image analysis' },
+  { key: 'web_extract', label: 'Web extract', hint: 'Page summarization' },
+  { key: 'compression', label: 'Compression', hint: 'Context compaction' },
+  { key: 'session_search', label: 'Session search', hint: 'Recall queries' },
+  { key: 'skills_hub', label: 'Skills hub', hint: 'Skill search' },
+  { key: 'approval', label: 'Approval', hint: 'Smart auto-approve' },
+  { key: 'mcp', label: 'MCP', hint: 'MCP tool routing' },
+  { key: 'title_generation', label: 'Title gen', hint: 'Session titles' },
+  { key: 'curator', label: 'Curator', hint: 'Skill-usage review' }
+]
+
+const USAGE_PERIODS = [7, 30, 90] as const
+type UsagePeriod = (typeof USAGE_PERIODS)[number]
 
 interface CommandCenterViewProps {
   initialSection?: CommandCenterSection
@@ -62,13 +88,15 @@ interface CommandCenterViewProps {
 const SECTION_LABELS: Record<CommandCenterSection, string> = {
   sessions: 'Sessions',
   system: 'System',
-  models: 'Models'
+  models: 'Models',
+  usage: 'Usage'
 }
 
 const SECTION_DESCRIPTIONS: Record<CommandCenterSection, string> = {
   sessions: 'Search and manage sessions',
   system: 'Status, logs, and system actions',
-  models: 'Global and auxiliary model controls'
+  models: 'Global and auxiliary model controls',
+  usage: 'Token, cost, and skill activity over time'
 }
 
 interface NavigationSearchEntry {
@@ -101,7 +129,8 @@ const NAVIGATION_SEARCH_ENTRIES: readonly NavigationSearchEntry[] = [
 const SECTION_SEARCH_ENTRIES: readonly SectionSearchEntry[] = [
   { id: 'section-sessions', section: 'sessions', title: 'Sessions panel', detail: 'Search, pin, and manage sessions' },
   { id: 'section-system', section: 'system', title: 'System panel', detail: 'Gateway status, logs, restart/update' },
-  { id: 'section-models', section: 'models', title: 'Models panel', detail: 'Main and auxiliary model assignments' }
+  { id: 'section-models', section: 'models', title: 'Models panel', detail: 'Main and auxiliary model assignments' },
+  { id: 'section-usage', section: 'usage', title: 'Usage panel', detail: 'Token, cost, and skill activity' }
 ]
 
 interface SessionSearchHit {
@@ -213,6 +242,12 @@ export function CommandCenterView({
   const [selectedModel, setSelectedModel] = useState('')
   const [auxiliary, setAuxiliary] = useState<AuxiliaryModelsResponse | null>(null)
   const [applyingModel, setApplyingModel] = useState(false)
+  const [editingAuxTask, setEditingAuxTask] = useState<null | string>(null)
+  const [auxDraft, setAuxDraft] = useState<{ model: string; provider: string }>({ model: '', provider: '' })
+  const [usagePeriod, setUsagePeriod] = useState<UsagePeriod>(30)
+  const [usage, setUsage] = useState<AnalyticsResponse | null>(null)
+  const [usageLoading, setUsageLoading] = useState(false)
+  const [usageError, setUsageError] = useState('')
   const searchRequestRef = useRef(0)
 
   const debouncedQuery = useDebouncedValue(query.trim(), 180)
@@ -330,6 +365,23 @@ export function CommandCenterView({
     }
   }, [])
 
+  const refreshUsage = useCallback(
+    async (days: UsagePeriod) => {
+      setUsageLoading(true)
+      setUsageError('')
+
+      try {
+        const response = await getUsageAnalytics(days)
+        setUsage(response)
+      } catch (error) {
+        setUsageError(error instanceof Error ? error.message : String(error))
+      } finally {
+        setUsageLoading(false)
+      }
+    },
+    []
+  )
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
@@ -391,6 +443,12 @@ export function CommandCenterView({
       void refreshModels()
     }
   }, [mainModel, modelsLoading, refreshModels, section])
+
+  useEffect(() => {
+    if (section === 'usage') {
+      void refreshUsage(usagePeriod)
+    }
+  }, [refreshUsage, section, usagePeriod])
 
   useEffect(() => {
     if (!selectedProviderModels.length) {
@@ -500,6 +558,49 @@ export function CommandCenterView({
     [mainModel, refreshModels]
   )
 
+  const applyAuxiliaryDraft = useCallback(
+    async (task: string) => {
+      if (!auxDraft.provider || !auxDraft.model) {
+        return
+      }
+
+      setApplyingModel(true)
+      setModelsError('')
+
+      try {
+        await setModelAssignment({
+          model: auxDraft.model,
+          provider: auxDraft.provider,
+          scope: 'auxiliary',
+          task
+        })
+        setEditingAuxTask(null)
+        await refreshModels()
+      } catch (error) {
+        setModelsError(error instanceof Error ? error.message : String(error))
+      } finally {
+        setApplyingModel(false)
+      }
+    },
+    [auxDraft, refreshModels]
+  )
+
+  const beginAuxiliaryEdit = useCallback(
+    (task: string) => {
+      const current = auxiliary?.tasks.find(entry => entry.task === task)
+      const initialProvider = current?.provider && current.provider !== 'auto' ? current.provider : mainModel?.provider ?? ''
+      const initialModel = current?.model || mainModel?.model || ''
+      setAuxDraft({ provider: initialProvider, model: initialModel })
+      setEditingAuxTask(task)
+    },
+    [auxiliary, mainModel]
+  )
+
+  const auxDraftProviderModels = useMemo(
+    () => providers.find(provider => provider.slug === auxDraft.provider)?.models ?? [],
+    [auxDraft.provider, providers]
+  )
+
   const resetAuxiliaryModels = useCallback(async () => {
     if (!mainModel) {
       return
@@ -562,7 +663,15 @@ export function CommandCenterView({
           {SECTIONS.map(value => (
             <OverlayNavItem
               active={section === value}
-              icon={value === 'sessions' ? Pin : value === 'system' ? Activity : Cpu}
+              icon={
+                value === 'sessions'
+                  ? Pin
+                  : value === 'system'
+                    ? Activity
+                    : value === 'models'
+                      ? Cpu
+                      : BarChart3
+              }
               key={value}
               label={SECTION_LABELS[value]}
               onClick={() => setSection(value)}
@@ -580,6 +689,12 @@ export function CommandCenterView({
               <OverlayActionButton disabled={systemLoading} onClick={() => void refreshSystem()}>
                 <IconRefresh className={cn('mr-1.5 size-3.5', systemLoading && 'animate-spin')} />
                 {systemLoading ? 'Refreshing...' : 'Refresh'}
+              </OverlayActionButton>
+            )}
+            {section === 'usage' && (
+              <OverlayActionButton disabled={usageLoading} onClick={() => void refreshUsage(usagePeriod)}>
+                <IconRefresh className={cn('mr-1.5 size-3.5', usageLoading && 'animate-spin')} />
+                {usageLoading ? 'Refreshing...' : 'Refresh'}
               </OverlayActionButton>
             )}
             {section === 'models' && (
@@ -733,6 +848,15 @@ export function CommandCenterView({
                 </div>
               )}
             </div>
+          ) : section === 'usage' ? (
+            <UsagePanel
+              error={usageError}
+              loading={usageLoading}
+              onPeriodChange={setUsagePeriod}
+              onRefresh={() => void refreshUsage(usagePeriod)}
+              period={usagePeriod}
+              usage={usage}
+            />
           ) : section === 'system' ? (
             <div className="grid min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)] gap-3">
               <OverlayCard className="p-3 text-sm">
@@ -858,25 +982,84 @@ export function CommandCenterView({
                   </OverlayActionButton>
                 </div>
                 <div className="grid gap-1.5">
-                  {(auxiliary?.tasks || []).map(task => (
-                    <OverlayCard className="flex items-center gap-2 px-2 py-1.5" key={task.task}>
-                      <div className="min-w-0 flex-1">
-                        <div className="truncate text-xs font-medium text-foreground">{task.task}</div>
-                        <div className="truncate text-[0.65rem] text-muted-foreground">
-                          {task.provider} / {task.model}
+                  {AUX_TASKS.map(meta => {
+                    const current = auxiliary?.tasks.find(entry => entry.task === meta.key)
+                    const isAuto = !current || !current.provider || current.provider === 'auto'
+                    const isEditing = editingAuxTask === meta.key
+
+                    return (
+                      <OverlayCard className="px-2 py-1.5" key={meta.key}>
+                        <div className="flex items-center gap-2">
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-baseline gap-2">
+                              <span className="text-xs font-medium text-foreground">{meta.label}</span>
+                              <span className="text-[0.62rem] text-muted-foreground/70">{meta.hint}</span>
+                            </div>
+                            <div className="truncate font-mono text-[0.62rem] text-muted-foreground">
+                              {isAuto
+                                ? 'auto · use main model'
+                                : `${current.provider} · ${current.model || '(provider default)'}`}
+                            </div>
+                          </div>
+                          {!isEditing && (
+                            <>
+                              <OverlayActionButton
+                                disabled={!mainModel || applyingModel}
+                                onClick={() => void setAuxiliaryToMain(meta.key)}
+                                tone="subtle"
+                              >
+                                Set to main
+                              </OverlayActionButton>
+                              <OverlayActionButton
+                                disabled={!providers.length || applyingModel}
+                                onClick={() => beginAuxiliaryEdit(meta.key)}
+                              >
+                                Change
+                              </OverlayActionButton>
+                            </>
+                          )}
                         </div>
-                      </div>
-                      <OverlayActionButton
-                        disabled={!mainModel || applyingModel}
-                        onClick={() => void setAuxiliaryToMain(task.task)}
-                      >
-                        Set to main
-                      </OverlayActionButton>
-                    </OverlayCard>
-                  ))}
-                  {!auxiliary?.tasks?.length && (
-                    <div className="text-xs text-muted-foreground">No auxiliary assignments reported.</div>
-                  )}
+
+                        {isEditing && (
+                          <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-border/40 pt-2">
+                            <select
+                              className="h-7 min-w-28 rounded-md border border-border bg-background px-2 text-[0.7rem] text-foreground"
+                              onChange={event =>
+                                setAuxDraft(prev => ({ ...prev, provider: event.target.value, model: '' }))
+                              }
+                              value={auxDraft.provider}
+                            >
+                              {(providers.length ? providers : [{ name: '—', slug: '', models: [] }]).map(provider => (
+                                <option key={provider.slug || 'none'} value={provider.slug}>
+                                  {provider.name}
+                                </option>
+                              ))}
+                            </select>
+                            <select
+                              className="h-7 min-w-44 rounded-md border border-border bg-background px-2 text-[0.7rem] text-foreground"
+                              onChange={event => setAuxDraft(prev => ({ ...prev, model: event.target.value }))}
+                              value={auxDraft.model}
+                            >
+                              {(auxDraftProviderModels.length ? auxDraftProviderModels : ['']).map(model => (
+                                <option key={model || 'none'} value={model}>
+                                  {model || 'No models available'}
+                                </option>
+                              ))}
+                            </select>
+                            <OverlayActionButton
+                              disabled={!auxDraft.provider || !auxDraft.model || applyingModel}
+                              onClick={() => void applyAuxiliaryDraft(meta.key)}
+                            >
+                              {applyingModel ? 'Applying...' : 'Apply'}
+                            </OverlayActionButton>
+                            <OverlayActionButton onClick={() => setEditingAuxTask(null)} tone="subtle">
+                              Cancel
+                            </OverlayActionButton>
+                          </div>
+                        )}
+                      </OverlayCard>
+                    )
+                  })}
                 </div>
               </OverlayCard>
             </div>
@@ -884,5 +1067,222 @@ export function CommandCenterView({
         </OverlayMain>
       </OverlaySplitLayout>
     </OverlayView>
+  )
+}
+
+function formatTokens(value: null | number | undefined): string {
+  const num = Number(value || 0)
+
+  if (num >= 1_000_000) {
+    return `${(num / 1_000_000).toFixed(1)}M`
+  }
+
+  if (num >= 1_000) {
+    return `${(num / 1_000).toFixed(1)}K`
+  }
+
+  return num.toLocaleString()
+}
+
+function formatCost(value: null | number | undefined): string {
+  const num = Number(value || 0)
+
+  if (num === 0) {
+    return '$0.00'
+  }
+
+  if (num < 0.01) {
+    return '<$0.01'
+  }
+
+  return `$${num.toFixed(2)}`
+}
+
+interface UsagePanelProps {
+  error: string
+  loading: boolean
+  onPeriodChange: (period: UsagePeriod) => void
+  onRefresh: () => void
+  period: UsagePeriod
+  usage: AnalyticsResponse | null
+}
+
+function UsagePanel({ error, loading, onPeriodChange, onRefresh, period, usage }: UsagePanelProps) {
+  const daily = useMemo(() => usage?.daily ?? [], [usage])
+  const totals = usage?.totals
+  const byModel = usage?.by_model ?? []
+  const topSkills = usage?.skills?.top_skills ?? []
+
+  const maxTokens = useMemo(() => {
+    if (!daily.length) {
+      return 1
+    }
+
+    return daily.reduce((acc, entry) => Math.max(acc, (entry.input_tokens || 0) + (entry.output_tokens || 0)), 1)
+  }, [daily])
+
+  return (
+    <div className="grid min-h-0 flex-1 grid-rows-[auto_auto_minmax(0,1fr)] gap-3">
+      <OverlayCard className="flex flex-wrap items-center justify-between gap-2 p-3">
+        <div className="flex items-center gap-1">
+          {USAGE_PERIODS.map(value => (
+            <button
+              className={cn(
+                'h-7 rounded-md px-2.5 text-xs transition-colors',
+                value === period
+                  ? 'bg-foreground text-background'
+                  : 'text-muted-foreground hover:bg-muted/40 hover:text-foreground'
+              )}
+              key={value}
+              onClick={() => onPeriodChange(value)}
+              type="button"
+            >
+              {value}d
+            </button>
+          ))}
+        </div>
+        {error && (
+          <span className="inline-flex items-center gap-1 text-xs text-destructive">
+            <AlertCircle className="size-3.5" />
+            {error}
+          </span>
+        )}
+      </OverlayCard>
+
+      <OverlayCard className="p-3">
+        {totals ? (
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            <UsageStat label="Sessions" value={totals.total_sessions.toLocaleString()} />
+            <UsageStat label="API calls" value={totals.total_api_calls.toLocaleString()} />
+            <UsageStat label="Tokens in/out" value={`${formatTokens(totals.total_input)} / ${formatTokens(totals.total_output)}`} />
+            <UsageStat
+              hint={totals.total_actual_cost > 0 ? `actual ${formatCost(totals.total_actual_cost)}` : undefined}
+              label="Est. cost"
+              value={formatCost(totals.total_estimated_cost)}
+            />
+          </div>
+        ) : loading ? (
+          <div className="text-xs text-muted-foreground">Loading usage...</div>
+        ) : (
+          <div className="text-xs text-muted-foreground">
+            No usage in the last {period} days.{' '}
+            <button className="underline" onClick={onRefresh} type="button">
+              Retry
+            </button>
+          </div>
+        )}
+      </OverlayCard>
+
+      <div className="grid min-h-0 grid-rows-[auto_minmax(0,1fr)] gap-3">
+        <OverlayCard className="p-3">
+          <div className="mb-2 flex items-baseline justify-between">
+            <span className="text-xs font-medium text-muted-foreground">Daily tokens</span>
+            <span className="flex items-center gap-3 text-[0.65rem] text-muted-foreground">
+              <span className="inline-flex items-center gap-1">
+                <span className="size-2 bg-[color:var(--dt-primary)]/60" /> input
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <span className="size-2 bg-emerald-500/70" /> output
+              </span>
+            </span>
+          </div>
+          {daily.length === 0 ? (
+            <div className="grid h-24 place-items-center text-xs text-muted-foreground">No daily activity.</div>
+          ) : (
+            <>
+              <div className="flex h-24 items-end gap-px">
+                {daily.map(entry => {
+                  const total = (entry.input_tokens || 0) + (entry.output_tokens || 0)
+                  const inputH = Math.round(((entry.input_tokens || 0) / maxTokens) * 96)
+                  const outputH = Math.round(((entry.output_tokens || 0) / maxTokens) * 96)
+
+                  return (
+                    <div
+                      className="group relative flex h-24 min-w-0 flex-1 flex-col justify-end"
+                      key={entry.day}
+                      title={`${entry.day} · in ${formatTokens(entry.input_tokens)} · out ${formatTokens(entry.output_tokens)}`}
+                    >
+                      <div
+                        className="w-full bg-[color:var(--dt-primary)]/50"
+                        style={{ height: Math.max(inputH, total > 0 ? 1 : 0) }}
+                      />
+                      <div
+                        className="w-full bg-emerald-500/60"
+                        style={{ height: Math.max(outputH, entry.output_tokens > 0 ? 1 : 0) }}
+                      />
+                    </div>
+                  )
+                })}
+              </div>
+              <div className="mt-1 flex justify-between text-[0.6rem] text-muted-foreground/70">
+                <span>{daily[0]?.day}</span>
+                <span>{daily[daily.length - 1]?.day}</span>
+              </div>
+            </>
+          )}
+        </OverlayCard>
+
+        <OverlayCard className="min-h-0 overflow-auto p-2">
+          <div className="grid gap-3 sm:grid-cols-2">
+            <section className="min-w-0">
+              <div className="mb-1.5 text-[0.7rem] font-medium uppercase tracking-wide text-muted-foreground">
+                Top models
+              </div>
+              {byModel.length === 0 ? (
+                <div className="text-xs text-muted-foreground">No model usage yet.</div>
+              ) : (
+                <ul className="space-y-1">
+                  {byModel.slice(0, 6).map(entry => (
+                    <li
+                      className="flex items-center justify-between gap-2 rounded px-1.5 py-1 text-xs hover:bg-muted/40"
+                      key={entry.model}
+                    >
+                      <span className="min-w-0 truncate font-mono text-[0.7rem] text-foreground">{entry.model}</span>
+                      <span className="shrink-0 text-[0.65rem] text-muted-foreground">
+                        {formatTokens((entry.input_tokens || 0) + (entry.output_tokens || 0))} ·{' '}
+                        {formatCost(entry.estimated_cost)}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+
+            <section className="min-w-0">
+              <div className="mb-1.5 text-[0.7rem] font-medium uppercase tracking-wide text-muted-foreground">
+                Top skills
+              </div>
+              {topSkills.length === 0 ? (
+                <div className="text-xs text-muted-foreground">No skill activity yet.</div>
+              ) : (
+                <ul className="space-y-1">
+                  {topSkills.slice(0, 6).map(entry => (
+                    <li
+                      className="flex items-center justify-between gap-2 rounded px-1.5 py-1 text-xs hover:bg-muted/40"
+                      key={entry.skill}
+                    >
+                      <span className="min-w-0 truncate font-mono text-[0.7rem] text-foreground">{entry.skill}</span>
+                      <span className="shrink-0 text-[0.65rem] text-muted-foreground">
+                        {entry.total_count.toLocaleString()} actions
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+          </div>
+        </OverlayCard>
+      </div>
+    </div>
+  )
+}
+
+function UsageStat({ hint, label, value }: { hint?: string; label: string; value: string }) {
+  return (
+    <div className="min-w-0">
+      <div className="text-[0.65rem] font-medium uppercase tracking-[0.12em] text-muted-foreground">{label}</div>
+      <div className="mt-0.5 truncate text-sm font-semibold tracking-tight text-foreground">{value}</div>
+      {hint && <div className="mt-0.5 truncate text-[0.62rem] text-muted-foreground/80">{hint}</div>}
+    </div>
   )
 }

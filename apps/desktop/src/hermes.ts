@@ -3,10 +3,14 @@ import { JsonRpcGatewayClient } from '@hermes/shared'
 import type {
   ActionResponse,
   ActionStatusResponse,
+  AnalyticsResponse,
   AudioSpeakResponse,
   AudioTranscriptionResponse,
   AuxiliaryModelsResponse,
   ConfigSchemaResponse,
+  CronJob,
+  CronJobCreatePayload,
+  CronJobUpdates,
   ElevenLabsVoicesResponse,
   EnvVarInfo,
   HermesConfig,
@@ -24,6 +28,10 @@ import type {
   OAuthStartResponse,
   OAuthSubmitResponse,
   PaginatedSessions,
+  ProfileCreatePayload,
+  ProfileSetupCommand,
+  ProfileSoul,
+  ProfilesResponse,
   SessionMessagesResponse,
   SessionSearchResponse,
   SkillInfo,
@@ -36,11 +44,21 @@ const DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS = 30_000
 export type {
   ActionResponse,
   ActionStatusResponse,
+  AnalyticsDailyEntry,
+  AnalyticsModelEntry,
+  AnalyticsResponse,
+  AnalyticsSkillEntry,
+  AnalyticsSkillsSummary,
+  AnalyticsTotals,
   AudioSpeakResponse,
   AudioTranscriptionResponse,
   AuxiliaryModelsResponse,
   ConfigFieldSchema,
   ConfigSchemaResponse,
+  CronJob,
+  CronJobCreatePayload,
+  CronJobSchedule,
+  CronJobUpdates,
   ElevenLabsVoice,
   ElevenLabsVoicesResponse,
   EnvVarInfo,
@@ -60,6 +78,11 @@ export type {
   ModelOptionProvider,
   ModelOptionsResponse,
   PaginatedSessions,
+  ProfileCreatePayload,
+  ProfileInfo,
+  ProfileSetupCommand,
+  ProfileSoul,
+  ProfilesResponse,
   RpcEvent,
   SessionCreateResponse,
   SessionInfo,
@@ -306,6 +329,122 @@ export function testMessagingPlatform(platformId: string): Promise<MessagingPlat
   return window.hermesDesktop.api<MessagingPlatformTestResponse>({
     path: `/api/messaging/platforms/${encodeURIComponent(platformId)}/test`,
     method: 'POST'
+  })
+}
+
+export function getCronJobs(): Promise<CronJob[]> {
+  return window.hermesDesktop.api<CronJob[]>({
+    path: '/api/cron/jobs'
+  })
+}
+
+export function getCronJob(jobId: string): Promise<CronJob> {
+  return window.hermesDesktop.api<CronJob>({
+    path: `/api/cron/jobs/${encodeURIComponent(jobId)}`
+  })
+}
+
+export function createCronJob(body: CronJobCreatePayload): Promise<CronJob> {
+  return window.hermesDesktop.api<CronJob>({
+    path: '/api/cron/jobs',
+    method: 'POST',
+    body
+  })
+}
+
+export function updateCronJob(jobId: string, updates: CronJobUpdates): Promise<CronJob> {
+  return window.hermesDesktop.api<CronJob>({
+    path: `/api/cron/jobs/${encodeURIComponent(jobId)}`,
+    method: 'PUT',
+    body: { updates }
+  })
+}
+
+export function pauseCronJob(jobId: string): Promise<CronJob> {
+  return window.hermesDesktop.api<CronJob>({
+    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/pause`,
+    method: 'POST'
+  })
+}
+
+export function resumeCronJob(jobId: string): Promise<CronJob> {
+  return window.hermesDesktop.api<CronJob>({
+    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/resume`,
+    method: 'POST'
+  })
+}
+
+export function triggerCronJob(jobId: string): Promise<CronJob> {
+  return window.hermesDesktop.api<CronJob>({
+    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/trigger`,
+    method: 'POST'
+  })
+}
+
+export function deleteCronJob(jobId: string): Promise<{ ok: boolean }> {
+  return window.hermesDesktop.api<{ ok: boolean }>({
+    path: `/api/cron/jobs/${encodeURIComponent(jobId)}`,
+    method: 'DELETE'
+  })
+}
+
+export function getProfiles(): Promise<ProfilesResponse> {
+  return window.hermesDesktop.api<ProfilesResponse>({
+    path: '/api/profiles'
+  })
+}
+
+export function createProfile(
+  body: ProfileCreatePayload
+): Promise<{ name: string; ok: boolean; path: string }> {
+  return window.hermesDesktop.api<{ name: string; ok: boolean; path: string }>({
+    path: '/api/profiles',
+    method: 'POST',
+    body
+  })
+}
+
+export function renameProfile(
+  name: string,
+  newName: string
+): Promise<{ name: string; ok: boolean; path: string }> {
+  return window.hermesDesktop.api<{ name: string; ok: boolean; path: string }>({
+    path: `/api/profiles/${encodeURIComponent(name)}`,
+    method: 'PATCH',
+    body: { new_name: newName }
+  })
+}
+
+export function deleteProfile(name: string): Promise<{ ok: boolean; path: string }> {
+  return window.hermesDesktop.api<{ ok: boolean; path: string }>({
+    path: `/api/profiles/${encodeURIComponent(name)}`,
+    method: 'DELETE'
+  })
+}
+
+export function getProfileSoul(name: string): Promise<ProfileSoul> {
+  return window.hermesDesktop.api<ProfileSoul>({
+    path: `/api/profiles/${encodeURIComponent(name)}/soul`
+  })
+}
+
+export function updateProfileSoul(name: string, content: string): Promise<{ ok: boolean }> {
+  return window.hermesDesktop.api<{ ok: boolean }>({
+    path: `/api/profiles/${encodeURIComponent(name)}/soul`,
+    method: 'PUT',
+    body: { content }
+  })
+}
+
+export function getProfileSetupCommand(name: string): Promise<ProfileSetupCommand> {
+  return window.hermesDesktop.api<ProfileSetupCommand>({
+    path: `/api/profiles/${encodeURIComponent(name)}/setup-command`
+  })
+}
+
+export function getUsageAnalytics(days = 30): Promise<AnalyticsResponse> {
+  return window.hermesDesktop.api<AnalyticsResponse>({
+    path: `/api/analytics/usage?days=${Math.max(1, Math.floor(days))}`
   })
 }
 

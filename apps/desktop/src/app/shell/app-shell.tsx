@@ -60,6 +60,10 @@ export function AppShell({
   const viewportFullscreen = useSyncExternalStore(subscribeWindowSize, viewportIsFullscreen, () => false)
   const isFullscreen = Boolean(connection?.isFullscreen) || viewportFullscreen
   const titlebarControls = titlebarControlsPosition(connection?.windowButtonPosition, isFullscreen)
+  // Width Windows/Linux reserve for the OS-painted min/max/close overlay (zero
+  // on macOS, where window controls sit on the left and are reported via
+  // windowButtonPosition instead). The right tool cluster has to clear them.
+  const nativeOverlayWidth = connection?.nativeOverlayWidth ?? 0
 
   const titlebarContentInset = sidebarOpen
     ? 0
@@ -68,9 +72,15 @@ export function AppShell({
   // The static system cluster (file-browser, haptics, settings) is hardcoded
   // in TitlebarControls. Pane-supplied tools (preview's group) render in a
   // separate cluster anchored further left.
+  //
+  // Width math has to include the `gap-x-1` (0.25rem) between buttons:
+  // N buttons + (N - 1) inner gaps, plus one extra 0.25rem of breathing room
+  // between the pane-tool cluster and the system cluster so they don't sit
+  // flush against each other. Modeled as N gaps (N - 1 inner + 1 trailing)
+  // to keep the formula generic for any pane-tool count.
   const SYSTEM_TOOL_COUNT = 3
   const paneToolCount = titlebarTools?.filter(tool => !tool.hidden).length ?? 0
-  const systemToolsWidth = `calc(${SYSTEM_TOOL_COUNT} * var(--titlebar-control-size))`
+  const systemToolsWidth = `calc(${SYSTEM_TOOL_COUNT} * (var(--titlebar-control-size) + 0.25rem))`
 
   const fileBrowserWidth =
     fileBrowserWidthOverride !== undefined ? `${fileBrowserWidthOverride}px` : FILE_BROWSER_DEFAULT_WIDTH
@@ -83,12 +93,13 @@ export function AppShell({
   const previewToolbarGap = fileBrowserOpen ? fileBrowserWidth : systemToolsWidth
 
   // Used by the drag region to know where the rightmost interactive element
-  // ends. When pane tools are present, that's `gap + paneCount * controlSize`
-  // (the leftmost button is at `tools-right + gap + paneCount * size`).
-  // Otherwise the static cluster's footprint is enough.
+  // ends. When pane tools are present, that's `gap + paneCount * controlSize
+  // + paneCount * 0.25rem` (the leftmost button is at `tools-right + gap +
+  // paneCount * (size + gap-x-1)`). Otherwise the static cluster's footprint
+  // is enough.
   const titlebarToolsWidth =
     paneToolCount > 0
-      ? `calc(${previewToolbarGap} + ${paneToolCount} * var(--titlebar-control-size))`
+      ? `calc(${previewToolbarGap} + ${paneToolCount} * (var(--titlebar-control-size) + 0.25rem))`
       : systemToolsWidth
 
   return (
@@ -105,7 +116,7 @@ export function AppShell({
           '--titlebar-content-inset': `${titlebarContentInset}px`,
           '--titlebar-controls-left': `${titlebarControls.left}px`,
           '--titlebar-controls-top': `${titlebarControls.top}px`,
-          '--titlebar-tools-right': '0.75rem',
+          '--titlebar-tools-right': `calc(${nativeOverlayWidth}px + 0.75rem)`,
           '--titlebar-tools-width': titlebarToolsWidth,
           // Anchor for the pane-tool cluster's right edge in TitlebarControls.
           // Sourced from the layout store rather than the PaneShell-emitted
