@@ -127,6 +127,29 @@ default_permissions = ":read-only"
 
 (Hermes will preserve your override on re-migration as long as it lives outside the `# managed by hermes-agent` markers.)
 
+## Editing `~/.codex/config.toml` safely
+
+Hermes wraps everything it manages between two marker comments:
+
+```toml
+# managed by hermes-agent — `hermes codex-runtime migrate` regenerates this section
+default_permissions = ":workspace"
+[mcp_servers.filesystem]
+...
+[plugins."github@openai-curated"]
+...
+# end hermes-agent managed section
+```
+
+Anything **outside** that block is yours. Re-running migration (via `/codex-runtime codex_app_server` or whenever you toggle the runtime on) replaces the managed block in place but preserves user content above and below it verbatim. This means you can:
+
+- Add your own MCP servers Hermes doesn't know about
+- Override `default_permissions` to `:read-only` if you prefer to be prompted
+- Configure codex-only options (model, providers, otel, etc.)
+- Add user-defined permission profiles in `[permissions.<name>]` tables
+
+Anything you add **inside** the managed block will get clobbered on the next migration. If you need a tweak that requires editing the managed block, file an issue and we'll add the knob.
+
 ## MCP server migration
 
 Hermes' `mcp_servers` config is auto-translated to the TOML format Codex expects. The migration runs every time you enable the runtime and is idempotent — re-runs replace the managed section but preserve any user-edited Codex config.

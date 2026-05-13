@@ -455,6 +455,39 @@ class TestMigrate:
         assert "[mcp_servers.a]" in new_text
         assert MIGRATION_MARKER in new_text
 
+    def test_preserves_user_mcp_server_outside_managed_block(self, tmp_path):
+        """Quirk #6: when a user adds their own MCP server entry directly
+        to ~/.codex/config.toml outside Hermes' managed block, re-running
+        migration must preserve it. Tested both above and below the
+        managed block."""
+        target = tmp_path / "config.toml"
+        target.write_text(
+            "[mcp_servers.user-above]\n"
+            'command = "/usr/bin/above-server"\n'
+            'args = ["--above"]\n'
+        )
+        # First migrate — adds managed block below user content
+        migrate({"mcp_servers": {"hermes-mcp": {"command": "npx"}}},
+                codex_home=tmp_path, discover_plugins=False,
+                expose_hermes_tools=False)
+        text = target.read_text()
+        assert "user-above" in text, "user MCP server above managed block got nuked"
+        assert 'command = "/usr/bin/above-server"' in text
+
+        # Append another user entry below the managed block
+        target.write_text(
+            text + "\n[mcp_servers.user-below]\ncommand = \"below-server\"\n"
+        )
+        # Re-migrate — both should survive
+        migrate({"mcp_servers": {"hermes-mcp": {"command": "npx"}}},
+                codex_home=tmp_path, discover_plugins=False,
+                expose_hermes_tools=False)
+        final = target.read_text()
+        assert "user-above" in final
+        assert "user-below" in final
+        # And our managed block is still there with the new content
+        assert "[mcp_servers.hermes-mcp]" in final
+
     def test_skipped_keys_reported(self, tmp_path):
         report = migrate({
             "mcp_servers": {
