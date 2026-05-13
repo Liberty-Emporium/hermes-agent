@@ -345,12 +345,12 @@ export interface AnalyticsSkillsSummary {
 
 export interface AnalyticsTotals {
   total_actual_cost: number
-  total_api_calls: number
-  total_cache_read: number
+  total_api_calls: null | number
+  total_cache_read: null | number
   total_estimated_cost: number
-  total_input: number
-  total_output: number
-  total_reasoning: number
+  total_input: null | number
+  total_output: null | number
+  total_reasoning: null | number
   total_sessions: number
 }
 

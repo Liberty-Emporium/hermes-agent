@@ -1098,6 +1098,10 @@ function formatCost(value: null | number | undefined): string {
   return `$${num.toFixed(2)}`
 }
 
+function formatInteger(value: null | number | undefined): string {
+  return Number(value ?? 0).toLocaleString()
+}
+
 interface UsagePanelProps {
   error: string
   loading: boolean
@@ -1152,9 +1156,12 @@ function UsagePanel({ error, loading, onPeriodChange, onRefresh, period, usage }
       <OverlayCard className="p-3">
         {totals ? (
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-            <UsageStat label="Sessions" value={totals.total_sessions.toLocaleString()} />
-            <UsageStat label="API calls" value={totals.total_api_calls.toLocaleString()} />
-            <UsageStat label="Tokens in/out" value={`${formatTokens(totals.total_input)} / ${formatTokens(totals.total_output)}`} />
+            <UsageStat label="Sessions" value={formatInteger(totals.total_sessions)} />
+            <UsageStat label="API calls" value={formatInteger(totals.total_api_calls)} />
+            <UsageStat
+              label="Tokens in/out"
+              value={`${formatTokens(totals.total_input)} / ${formatTokens(totals.total_output)}`}
+            />
             <UsageStat
               hint={totals.total_actual_cost > 0 ? `actual ${formatCost(totals.total_actual_cost)}` : undefined}
               label="Est. cost"
@@ -1204,7 +1211,7 @@ function UsagePanel({ error, loading, onPeriodChange, onRefresh, period, usage }
                     >
                       <div
                         className="w-full bg-[color:var(--dt-primary)]/50"
-                        style={{ height: Math.max(inputH, total > 0 ? 1 : 0) }}
+                        style={{ height: Math.max(inputH, entry.input_tokens > 0 ? 1 : 0) }}
                       />
                       <div
                         className="w-full bg-emerald-500/60"
