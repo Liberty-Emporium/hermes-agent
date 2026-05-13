@@ -1,13 +1,15 @@
 import type { Dispatch, SetStateAction } from 'react'
 
+import type { HermesGateway } from '@/hermes'
 import type { LucideIcon } from '@/lib/icons'
 import type { EnvVarInfo } from '@/types/hermes'
 
-export type SettingsView = 'about' | 'gateway' | 'keys' | 'tools' | `config:${string}`
-export type SettingsQueryKey = 'about' | 'config' | 'gateway' | 'keys' | 'tools'
+export type SettingsView = 'about' | 'gateway' | 'keys' | 'mcp' | 'tools' | `config:${string}`
+export type SettingsQueryKey = 'about' | 'config' | 'gateway' | 'keys' | 'mcp' | 'tools'
 export type EnvPatch = Partial<Pick<EnvVarInfo, 'is_set' | 'redacted_value'>>
 
 export interface SettingsPageProps {
+  gateway?: HermesGateway | null
   onClose: () => void
   onConfigSaved?: () => void
 }

@@ -31,6 +31,7 @@ import {
   setCurrentUsage,
   setTurnStartedAt
 } from '@/store/session'
+import { clearSessionSubagents, upsertSubagent } from '@/store/subagents'
 import { recordToolDiff } from '@/store/tool-diffs'
 import type { RpcEvent } from '@/types/hermes'
 
@@ -59,6 +60,14 @@ interface QueuedStreamDeltas {
 }
 
 const STREAM_DELTA_FLUSH_MS = 16
+const SUBAGENT_EVENT_TYPES = new Set([
+  'subagent.spawn_requested',
+  'subagent.start',
+  'subagent.thinking',
+  'subagent.tool',
+  'subagent.progress',
+  'subagent.complete'
+])
 
 // Anonymous progress events that carry todos but no name still belong to the
 // todo stream; named todo events are obviously routed there too.
@@ -506,6 +515,7 @@ export function useMessageStream({
         }
 
         flushQueuedDeltas(sessionId)
+        clearSessionSubagents(sessionId)
 
         if (isActiveEvent) {
           triggerHaptic('streamStart')
@@ -574,6 +584,10 @@ export function useMessageStream({
 
         if (typeof payload?.inline_diff === 'string' && payload.inline_diff.trim()) {
           recordToolDiff(payload.tool_id || payload.name || '', payload.inline_diff)
+        }
+      } else if (SUBAGENT_EVENT_TYPES.has(event.type)) {
+        if (sessionId && payload) {
+          upsertSubagent(sessionId, payload as Record<string, unknown>, event.type === 'subagent.spawn_requested')
         }
       } else if (event.type === 'clarify.request') {
         if (!isActiveEvent) {

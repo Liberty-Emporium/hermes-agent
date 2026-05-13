@@ -22,6 +22,7 @@ import {
   $workingSessionIds,
   setModelPickerOpen
 } from '@/store/session'
+import { $subagentsBySession, activeSubagentCount } from '@/store/subagents'
 import { $desktopVersion, $updateApply, $updateStatus, setUpdateOverlayOpen } from '@/store/updates'
 import type { StatusResponse } from '@/types/hermes'
 
@@ -63,6 +64,7 @@ export function useStatusbarItems({
   const sessionStartedAt = useStore($sessionStartedAt)
   const turnStartedAt = useStore($turnStartedAt)
   const workingSessionIds = useStore($workingSessionIds)
+  const subagentsBySession = useStore($subagentsBySession)
   const updateStatus = useStore($updateStatus)
   const updateApply = useStore($updateApply)
   const desktopVersion = useStore($desktopVersion)
@@ -106,15 +108,20 @@ export function useStatusbarItems({
     [gatewayLogLines, handleRestartGateway, openCommandCenterSection, restartingGateway, statusSnapshot]
   )
 
-  const { bgFailed, bgRunning } = useMemo(() => {
+  const { bgFailed, bgRunning, subagentsRunning } = useMemo(() => {
     const actions = Object.values(desktopActionTasks)
     const running = actions.filter(t => t.status.running).length
     const failed = actions.filter(t => !t.status.running && (t.status.exit_code ?? 0) !== 0).length
     const previewRunning = previewServerRestartStatus === 'running' ? 1 : 0
     const previewFailed = previewServerRestartStatus === 'error' ? 1 : 0
+    const subagentsRunning = Object.values(subagentsBySession).reduce((sum, items) => sum + activeSubagentCount(items), 0)
 
-    return { bgFailed: failed + previewFailed, bgRunning: workingSessionIds.length + running + previewRunning }
-  }, [desktopActionTasks, previewServerRestartStatus, workingSessionIds])
+    return {
+      bgFailed: failed + previewFailed,
+      bgRunning: workingSessionIds.length + running + previewRunning,
+      subagentsRunning
+    }
+  }, [desktopActionTasks, previewServerRestartStatus, subagentsBySession, workingSessionIds])
 
   const gatewayUp = Boolean(statusSnapshot?.gateway_running)
 
@@ -189,11 +196,18 @@ export function useStatusbarItems({
           agentsOpen && 'bg-accent/55 text-foreground',
           bgFailed > 0 && 'text-destructive hover:text-destructive'
         ),
-        detail: bgFailed > 0 ? `${bgFailed} failed` : bgRunning > 0 ? `${bgRunning} running` : undefined,
+        detail:
+          subagentsRunning > 0
+            ? `${subagentsRunning} subagent${subagentsRunning === 1 ? '' : 's'}`
+            : bgFailed > 0
+              ? `${bgFailed} failed`
+              : bgRunning > 0
+                ? `${bgRunning} running`
+                : undefined,
         icon:
           bgFailed > 0 ? (
             <AlertCircle className="size-3" />
-          ) : bgRunning > 0 ? (
+          ) : bgRunning > 0 || subagentsRunning > 0 ? (
             <Loader2 className="size-3 animate-spin" />
           ) : (
             <Sparkles className="size-3" />
@@ -214,6 +228,7 @@ export function useStatusbarItems({
       gatewayUp,
       openAgents,
       statusSnapshot?.gateway_state,
+      subagentsRunning,
       toggleCommandCenter
     ]
   )
