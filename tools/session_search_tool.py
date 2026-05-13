@@ -26,16 +26,19 @@ MAX_SESSION_CHARS = 100_000
 
 
 # Default mode is summary unless the user opts into a different one via
-# ``tools.session_search.default_mode`` in ~/.hermes/config.yaml. Only ``fast``
-# and ``summary`` are valid defaults — guided requires anchors and can't be
-# used standalone. Wrapped in lru_cache so the YAML read happens at most once
-# per process; the CLI / TUI is the typical caller and config changes need a
-# restart anyway.
+# ``auxiliary.session_search.default_mode`` in ~/.hermes/config.yaml. Lives
+# alongside the other session_search-scoped knobs (provider, model,
+# max_concurrency) — "auxiliary" started as aux-LLM routing but in practice
+# groups per-tool config by tool name. Only ``fast`` and ``summary`` are
+# valid defaults — guided requires anchors and can't be used standalone.
+# Wrapped in lru_cache so the YAML read happens at most once per process;
+# the CLI / TUI is the typical caller and config changes need a restart
+# anyway.
 _VALID_DEFAULT_MODES = ("fast", "summary")
 
 
 def _resolve_user_default_mode() -> str:
-    """Look up ``tools.session_search.default_mode`` from ~/.hermes/config.yaml.
+    """Look up ``auxiliary.session_search.default_mode`` from ~/.hermes/config.yaml.
 
     Returns "summary" if unset, invalid, or the config loader is unavailable
     (e.g. tests, tools loaded outside the CLI). Logs a one-time warning on
@@ -52,7 +55,7 @@ def _resolve_user_default_mode() -> str:
         return "summary"
 
     raw = (
-        config.get("tools", {})
+        config.get("auxiliary", {})
         .get("session_search", {})
         .get("default_mode")
     )
@@ -60,14 +63,14 @@ def _resolve_user_default_mode() -> str:
         return "summary"
     if not isinstance(raw, str):
         logging.warning(
-            "tools.session_search.default_mode in config.yaml must be a string, got %r — falling back to 'summary'",
+            "auxiliary.session_search.default_mode in config.yaml must be a string, got %r — falling back to 'summary'",
             raw,
         )
         return "summary"
     normalised = raw.strip().lower()
     if normalised not in _VALID_DEFAULT_MODES:
         logging.warning(
-            "tools.session_search.default_mode=%r is not one of %s — falling back to 'summary'. "
+            "auxiliary.session_search.default_mode=%r is not one of %s — falling back to 'summary'. "
             "(guided requires anchors and cannot be a default.)",
             raw, _VALID_DEFAULT_MODES,
         )
@@ -1124,7 +1127,7 @@ SESSION_SEARCH_SCHEMA = {
         "Returns titles, previews, timestamps. Zero LLM cost, instant. Start here when the user "
         "asks 'what were we working on' or 'what did we do recently'.\n\n"
         "The default mode is configurable per-user via "
-        "``tools.session_search.default_mode: fast`` in ~/.hermes/config.yaml. When no mode is "
+        "``auxiliary.session_search.default_mode: fast`` in ~/.hermes/config.yaml. When no mode is "
         "passed explicitly, that user-configured value applies (then 'summary' as the final "
         "fallback).\n\n"
         "USE THIS PROACTIVELY when:\n"

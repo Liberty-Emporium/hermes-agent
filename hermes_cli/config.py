@@ -828,6 +828,7 @@ DEFAULT_CONFIG = {
             "timeout": 30,
             "extra_body": {},
             "max_concurrency": 3,  # Clamp parallel summaries to avoid request-burst 429s on small providers
+            "default_mode": "summary",  # 'fast' | 'summary' — which mode session_search uses when caller passes none
         },
         "skills_hub": {
             "provider": "auto",

@@ -746,7 +746,7 @@ class TestSessionSearch:
 
         If the handler substitutes "summary" when the LLM omits ``mode``, then
         ``_resolve_user_default_mode()`` is structurally unreachable from real
-        tool calls and the ``tools.session_search.default_mode`` config knob
+        tool calls and the ``auxiliary.session_search.default_mode`` config knob
         becomes dead code. This is the registry-handler counterpart to
         ``test_run_agent_special_session_search_paths_forward_mode``.
         """
@@ -761,13 +761,13 @@ class TestSessionSearch:
         )
         assert 'mode=args.get("mode", "summary")' not in source, (
             "registry handler must not hardcode \"summary\" as the mode default — "
-            "it shadows tools.session_search.default_mode in config.yaml"
+            "it shadows auxiliary.session_search.default_mode in config.yaml"
         )
 
     def test_unset_mode_via_registry_honours_configured_default(self, monkeypatch):
         """End-to-end: unset mode through the registry handler resolves to config.
 
-        With ``tools.session_search.default_mode: fast`` configured, an LLM tool
+        With ``auxiliary.session_search.default_mode: fast`` configured, an LLM tool
         call that omits ``mode`` must run in fast mode (no aux LLM), not summary.
         This is the regression test for the bug where three layers of hardcoded
         ``"summary"`` defaults made the config knob unreachable.
@@ -779,7 +779,7 @@ class TestSessionSearch:
         self._clear_default_mode_cache()
         monkeypatch.setattr(
             "hermes_cli.config.load_config",
-            lambda: {"tools": {"session_search": {"default_mode": "fast"}}},
+            lambda: {"auxiliary": {"session_search": {"default_mode": "fast"}}},
         )
         # Sanity: the resolver itself sees fast.
         assert _resolve_user_default_mode() == "fast"
@@ -798,7 +798,7 @@ class TestSessionSearch:
         )
 
     # -----------------------------------------------------------------
-    # User-configurable default mode (tools.session_search.default_mode
+    # User-configurable default mode (auxiliary.session_search.default_mode
     # in ~/.hermes/config.yaml). Lets a user opt into fast-as-default
     # without having to pass mode= on every call.
     # -----------------------------------------------------------------
@@ -818,12 +818,12 @@ class TestSessionSearch:
         assert _resolve_user_default_mode() == "summary"
 
     def test_user_can_configure_fast_as_default(self, monkeypatch):
-        """tools.session_search.default_mode: fast → unset mode resolves to 'fast'."""
+        """auxiliary.session_search.default_mode: fast → unset mode resolves to 'fast'."""
         from tools.session_search_tool import _resolve_user_default_mode
         self._clear_default_mode_cache()
         monkeypatch.setattr(
             "hermes_cli.config.load_config",
-            lambda: {"tools": {"session_search": {"default_mode": "fast"}}},
+            lambda: {"auxiliary": {"session_search": {"default_mode": "fast"}}},
         )
         assert _resolve_user_default_mode() == "fast"
 
@@ -833,7 +833,7 @@ class TestSessionSearch:
         self._clear_default_mode_cache()
         monkeypatch.setattr(
             "hermes_cli.config.load_config",
-            lambda: {"tools": {"session_search": {"default_mode": "summary"}}},
+            lambda: {"auxiliary": {"session_search": {"default_mode": "summary"}}},
         )
         assert _resolve_user_default_mode() == "summary"
 
@@ -844,7 +844,7 @@ class TestSessionSearch:
         self._clear_default_mode_cache()
         monkeypatch.setattr(
             "hermes_cli.config.load_config",
-            lambda: {"tools": {"session_search": {"default_mode": "smary"}}},
+            lambda: {"auxiliary": {"session_search": {"default_mode": "smary"}}},
         )
         with caplog.at_level(logging.WARNING):
             assert _resolve_user_default_mode() == "summary"
@@ -857,7 +857,7 @@ class TestSessionSearch:
         self._clear_default_mode_cache()
         monkeypatch.setattr(
             "hermes_cli.config.load_config",
-            lambda: {"tools": {"session_search": {"default_mode": "guided"}}},
+            lambda: {"auxiliary": {"session_search": {"default_mode": "guided"}}},
         )
         assert _resolve_user_default_mode() == "summary"
 
@@ -868,7 +868,7 @@ class TestSessionSearch:
         for bad in (42, ["fast"], {"mode": "fast"}, True):
             monkeypatch.setattr(
                 "hermes_cli.config.load_config",
-                lambda b=bad: {"tools": {"session_search": {"default_mode": b}}},
+                lambda b=bad: {"auxiliary": {"session_search": {"default_mode": b}}},
             )
             self._clear_default_mode_cache()
             assert _resolve_user_default_mode() == "summary", f"bad value {bad!r} should fall back"
@@ -881,7 +881,7 @@ class TestSessionSearch:
         self._clear_default_mode_cache()
         monkeypatch.setattr(
             "hermes_cli.config.load_config",
-            lambda: {"tools": {"session_search": {"default_mode": "fast"}}},
+            lambda: {"auxiliary": {"session_search": {"default_mode": "fast"}}},
         )
         mock_db = MagicMock()
         mock_db.search_messages.return_value = []
@@ -900,7 +900,7 @@ class TestSessionSearch:
         self._clear_default_mode_cache()
         monkeypatch.setattr(
             "hermes_cli.config.load_config",
-            lambda: {"tools": {"session_search": {"default_mode": "fast"}}},
+            lambda: {"auxiliary": {"session_search": {"default_mode": "fast"}}},
         )
 
         async def fail_summarize(*_args, **_kwargs):
