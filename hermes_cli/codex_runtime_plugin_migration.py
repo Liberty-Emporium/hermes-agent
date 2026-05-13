@@ -37,6 +37,7 @@ What's NOT migrated (intentional):
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -44,10 +45,13 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
-# Marker comment at the top of the migrated section so re-runs can detect
-# what's ours and what's user-edited.
+# Marker comments wrapping the managed section so re-runs can detect
+# what's ours and what's user-edited. Both must appear or strip is a no-op.
 MIGRATION_MARKER = (
     "# managed by hermes-agent — `hermes codex-runtime migrate` regenerates this section"
+)
+MIGRATION_END_MARKER = (
+    "# end hermes-agent managed section"
 )
 
 
@@ -91,7 +95,7 @@ class MigrationReport:
             lines.append(f"Codex plugin discovery skipped: {self.plugin_query_error}")
         if self.wrote_permissions_default:
             lines.append(
-                f"Wrote [permissions] default = "
+                f"Wrote default_permissions = "
                 f"{self.wrote_permissions_default!r}"
             )
         for err in self.errors:
@@ -244,12 +248,22 @@ def render_codex_toml_section(
     out = [MIGRATION_MARKER]
     if not servers and not plugins and not default_permission_profile:
         out.append("# (no MCP servers, plugins, or permissions configured by Hermes)")
+        out.append(MIGRATION_END_MARKER)
         return "\n".join(out) + "\n"
 
     if default_permission_profile:
+        # Codex's config schema: `default_permissions` is a top-level
+        # string referencing a profile name. Built-in profile names start
+        # with ":" (":workspace-write", ":read-only", ":full-access"). The
+        # [permissions] table is for *user-defined* named profiles with
+        # structured fields — not what we want.
+        normalized = (
+            default_permission_profile
+            if default_permission_profile.startswith(":")
+            else f":{default_permission_profile}"
+        )
         out.append("")
-        out.append("[permissions]")
-        out.append(f"default = {_format_toml_value(default_permission_profile)}")
+        out.append(f"default_permissions = {_format_toml_value(normalized)}")
 
     if servers:
         for name in sorted(servers.keys()):
@@ -269,38 +283,52 @@ def render_codex_toml_section(
             out.append(f'[plugins.{_quote_key(qualified)}]')
             out.append(f"enabled = {_format_toml_value(enabled)}")
 
+    out.append("")
+    out.append(MIGRATION_END_MARKER)
     return "\n".join(out) + "\n"
 
 
 def _strip_existing_managed_block(toml_text: str) -> str:
     """Remove any prior managed section so re-runs idempotently replace it.
 
-    The managed section is everything between MIGRATION_MARKER and the next
-    section header that is NOT [mcp_servers.*] / [plugins.*] / [permissions]
-    OR end-of-file. User-edited sections above or below the managed block
-    are preserved verbatim."""
+    The managed section is everything between MIGRATION_MARKER (start) and
+    MIGRATION_END_MARKER (end), inclusive of both markers. User-edited
+    sections above or below are preserved verbatim.
+
+    Backward compatibility: if the start marker is found but no end marker
+    follows, we fall back to the heuristic that swallows lines until we
+    hit a section that's not [mcp_servers.*]/[plugins.*]/[permissions]/
+    a `default_permissions =` key. This matches what older versions of
+    this code wrote so re-runs don't break configs from prior Hermes
+    versions."""
     lines = toml_text.splitlines(keepends=True)
     out: list[str] = []
     in_managed = False
+    saw_end_marker = False
     for line in lines:
-        if line.rstrip("\n") == MIGRATION_MARKER:
+        line_stripped_nl = line.rstrip("\n")
+        if line_stripped_nl == MIGRATION_MARKER:
             in_managed = True
+            saw_end_marker = False
             continue
         if in_managed:
+            if line_stripped_nl == MIGRATION_END_MARKER:
+                in_managed = False
+                saw_end_marker = True
+                continue
             stripped = line.lstrip()
-            # Hand back control once we hit a section that's not part of
-            # what Hermes manages — codex's own config (model, providers,
-            # sandbox, otel, etc.) lives in those sections and we leave
-            # them alone.
-            if stripped.startswith("[") and not (
+            if not saw_end_marker and stripped.startswith("[") and not (
                 stripped.startswith("[mcp_servers")
                 or stripped.startswith("[plugins")
                 or stripped.startswith("[permissions]")
                 or stripped.startswith("[permissions.")
             ):
+                # Old-format managed block without end marker: bail back
+                # to user content as soon as we see a non-managed section.
                 in_managed = False
                 out.append(line)
-            # Otherwise swallow the line (it's part of the old managed block).
+                continue
+            # Otherwise swallow the line.
             continue
         out.append(line)
     return "".join(out)
@@ -371,13 +399,53 @@ def _query_codex_plugins(
     return out, None
 
 
+def _build_hermes_tools_mcp_entry() -> dict:
+    """Build the codex stdio-transport entry that launches Hermes' own
+    tool surface as an MCP server. Codex's subprocess will call back into
+    this for browser/web/delegate_task/vision/memory/skills tools.
+
+    The command runs the worktree's Python via the current sys.executable
+    so a hermes installed under /opt/, /usr/local/, or a venv all work.
+    HERMES_HOME and PYTHONPATH are passed through so the spawned process
+    sees the same config + module layout the user is running."""
+    import sys
+
+    env: dict[str, str] = {}
+    # HERMES_HOME passes through if set so the MCP subprocess sees the
+    # same config / auth / sessions DB as the parent CLI.
+    hermes_home = os.environ.get("HERMES_HOME")
+    if hermes_home:
+        env["HERMES_HOME"] = hermes_home
+    # PYTHONPATH passes through so a worktree-launched hermes finds the
+    # branch's modules instead of the installed package.
+    pythonpath = os.environ.get("PYTHONPATH")
+    if pythonpath:
+        env["PYTHONPATH"] = pythonpath
+    # Quiet mode + redaction defaults so the MCP wire stays clean.
+    env["HERMES_QUIET"] = "1"
+    env["HERMES_REDACT_SECRETS"] = env.get("HERMES_REDACT_SECRETS", "true")
+
+    out: dict[str, Any] = {
+        "command": sys.executable,
+        "args": ["-m", "agent.transports.hermes_tools_mcp_server"],
+    }
+    if env:
+        out["env"] = env
+    # Generous timeouts — browser_navigate or delegate_task can take a
+    # while; we don't want codex's MCP client to give up too early.
+    out["startup_timeout_sec"] = 30.0
+    out["tool_timeout_sec"] = 600.0
+    return out
+
+
 def migrate(
     hermes_config: dict,
     *,
     codex_home: Optional[Path] = None,
     dry_run: bool = False,
     discover_plugins: bool = True,
-    default_permission_profile: Optional[str] = "workspace-write",
+    default_permission_profile: Optional[str] = ":workspace",
+    expose_hermes_tools: bool = True,
 ) -> MigrationReport:
     """Translate Hermes mcp_servers config + Codex curated plugins into
     ~/.codex/config.toml.
@@ -390,11 +458,20 @@ def migrate(
             the live codex CLI to migrate any installed curated plugins
             into [plugins."<name>@<marketplace>"] entries. Set False to
             skip the subprocess spawn (for tests or restricted environments).
-        default_permission_profile: when set (default "workspace-write"),
-            write [permissions] default = profile so users on this runtime
-            don't get an approval prompt on every write attempt. Set None
-            to leave permissions unset and let codex use its built-in
+        default_permission_profile: when set (default ":workspace"), write
+            top-level `default_permissions = "<name>"` so users on this
+            runtime don't get an approval prompt on every write attempt.
+            Built-in codex profile names are ":workspace", ":read-only",
+            ":danger-no-sandbox" (note the leading ":"). Also accepts a
+            user-defined profile name (no leading ":") that the user has
+            configured in their own [permissions.<name>] table. Set None
+            to leave permissions unset and let codex use its compiled-in
             default (which is read-only).
+        expose_hermes_tools: when True (default), register Hermes' own
+            tool surface (web_search, browser_*, delegate_task, vision,
+            memory, skills, etc.) as an MCP server in ~/.codex/config.toml
+            so the codex subprocess can call back into Hermes for tools
+            codex doesn't have built in. Set False to opt out.
     """
     report = MigrationReport(dry_run=dry_run)
     codex_home = codex_home or Path.home() / ".codex"
@@ -435,6 +512,17 @@ def migrate(
     # surfaces it to the user.
     if default_permission_profile:
         report.wrote_permissions_default = default_permission_profile
+
+    # Inject Hermes' own tool surface as an MCP server so the spawned
+    # codex subprocess can call back into Hermes for the tools codex
+    # doesn't ship with — web_search, browser_*, delegate_task, vision,
+    # memory, skills, session_search, image_generate, text_to_speech.
+    # The server itself is agent/transports/hermes_tools_mcp_server.py
+    # and is launched on demand by codex (stdio MCP).
+    if expose_hermes_tools:
+        translated["hermes-tools"] = _build_hermes_tools_mcp_entry()
+        if "hermes-tools" not in report.migrated:
+            report.migrated.append("hermes-tools")
 
     # Build the new managed block
     managed_block = render_codex_toml_section(

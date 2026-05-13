@@ -236,13 +236,13 @@ class TestStripExistingManagedBlock:
         assert 'foo = "bar"' in out
 
 
-# ---- end-to-end migrate() ----
+# ---- end-to-end migrate(, expose_hermes_tools=False) ----
 
 class TestMigrate:
     def test_no_servers_no_plugins_no_perms_writes_placeholder(self, tmp_path):
         report = migrate({}, codex_home=tmp_path,
                          discover_plugins=False,
-                         default_permission_profile=None)
+                         default_permission_profile=None, expose_hermes_tools=False)
         assert report.written
         text = (tmp_path / "config.toml").read_text()
         assert MIGRATION_MARKER in text
@@ -252,19 +252,22 @@ class TestMigrate:
         """Even with zero MCP servers, enabling the runtime should write the
         default permissions profile so users don't get prompted on every
         write attempt. This is the fix for quirk #2."""
-        report = migrate({}, codex_home=tmp_path, discover_plugins=False)
+        report = migrate({}, codex_home=tmp_path, discover_plugins=False, expose_hermes_tools=False)
         assert report.written
         text = (tmp_path / "config.toml").read_text()
-        assert "[permissions]" in text
-        assert 'default = "workspace-write"' in text
-        assert report.wrote_permissions_default == "workspace-write"
+        # Codex's schema: top-level `default_permissions` keying a built-in
+        # profile name (prefixed with ":"). NOT a [permissions] section
+        # (which is for *user-defined* profiles with structured fields).
+        assert 'default_permissions = ":workspace"' in text
+        assert report.wrote_permissions_default == ":workspace"
 
     def test_explicit_none_permissions_skips_block(self, tmp_path):
         report = migrate({"mcp_servers": {"x": {"command": "y"}}},
                          codex_home=tmp_path,
                          discover_plugins=False,
-                         default_permission_profile=None)
+                         default_permission_profile=None, expose_hermes_tools=False)
         text = (tmp_path / "config.toml").read_text()
+        assert "default_permissions" not in text
         assert "[permissions]" not in text
         assert report.wrote_permissions_default is None
 
@@ -282,7 +285,7 @@ class TestMigrate:
             ], None
         monkeypatch.setattr(crpm, "_query_codex_plugins", fake_query)
 
-        report = migrate({}, codex_home=tmp_path, discover_plugins=True)
+        report = migrate({}, codex_home=tmp_path, discover_plugins=True, expose_hermes_tools=False)
         text = (tmp_path / "config.toml").read_text()
         assert '[plugins."github@openai-curated"]' in text
         assert '[plugins."google-calendar@openai-curated"]' in text
@@ -300,7 +303,7 @@ class TestMigrate:
         monkeypatch.setattr(crpm, "_query_codex_plugins", fake_query_fails)
 
         report = migrate({"mcp_servers": {"x": {"command": "y"}}},
-                         codex_home=tmp_path, discover_plugins=True)
+                         codex_home=tmp_path, discover_plugins=True, expose_hermes_tools=False)
         assert report.written
         assert report.migrated == ["x"]
         assert report.plugin_query_error == "codex CLI not available"
@@ -318,7 +321,7 @@ class TestMigrate:
         monkeypatch.setattr(crpm, "_query_codex_plugins", boom)
 
         migrate({"mcp_servers": {"x": {"command": "y"}}},
-                codex_home=tmp_path, discover_plugins=False)
+                codex_home=tmp_path, discover_plugins=False, expose_hermes_tools=False)
         assert called["yes"] is False
 
     def test_dry_run_skips_plugin_query(self, tmp_path, monkeypatch):
@@ -333,7 +336,7 @@ class TestMigrate:
         monkeypatch.setattr(crpm, "_query_codex_plugins", boom)
 
         migrate({"mcp_servers": {"x": {"command": "y"}}},
-                codex_home=tmp_path, dry_run=True, discover_plugins=True)
+                codex_home=tmp_path, dry_run=True, discover_plugins=True, expose_hermes_tools=False)
         assert called["yes"] is False
 
     def test_re_run_replaces_plugin_block(self, tmp_path, monkeypatch):
@@ -348,7 +351,7 @@ class TestMigrate:
                                 None,
                             ))
         migrate({}, codex_home=tmp_path, discover_plugins=True,
-                default_permission_profile=None)
+                default_permission_profile=None, expose_hermes_tools=False)
         first = (tmp_path / "config.toml").read_text()
         assert "github@openai-curated" in first
 
@@ -359,14 +362,44 @@ class TestMigrate:
                                 None,
                             ))
         migrate({}, codex_home=tmp_path, discover_plugins=True,
-                default_permission_profile=None)
+                default_permission_profile=None, expose_hermes_tools=False)
         second = (tmp_path / "config.toml").read_text()
         assert "github@openai-curated" not in second
         assert "canva@openai-curated" in second
 
+    def test_expose_hermes_tools_writes_callback_mcp_entry(self, tmp_path):
+        """When expose_hermes_tools=True (production default), an
+        [mcp_servers.hermes-tools] entry is written so codex calls back
+        into Hermes for browser/web/delegate_task/vision/memory tools.
+
+        This is the fix for 'all other tools that codex doesn't provide
+        should be useable by hermes' — quirk #7."""
+        report = migrate({}, codex_home=tmp_path,
+                         discover_plugins=False,
+                         default_permission_profile=None,
+                         expose_hermes_tools=True)
+        text = (tmp_path / "config.toml").read_text()
+        assert "[mcp_servers.hermes-tools]" in text
+        assert "hermes_tools_mcp_server" in text
+        # Must include startup + tool timeouts so codex doesn't give up
+        assert "startup_timeout_sec" in text
+        assert "tool_timeout_sec" in text
+        # And the entry is reported
+        assert "hermes-tools" in report.migrated
+
+    def test_expose_hermes_tools_disabled_skips_entry(self, tmp_path):
+        """expose_hermes_tools=False suppresses the callback registration."""
+        migrate({}, codex_home=tmp_path,
+                discover_plugins=False,
+                default_permission_profile=None,
+                expose_hermes_tools=False)
+        text = (tmp_path / "config.toml").read_text()
+        assert "[mcp_servers.hermes-tools]" not in text
+        assert "hermes_tools_mcp_server" not in text
+
     def test_dry_run_doesnt_write(self, tmp_path):
         report = migrate({"mcp_servers": {"x": {"command": "y"}}},
-                         codex_home=tmp_path, dry_run=True)
+                         codex_home=tmp_path, dry_run=True, expose_hermes_tools=False)
         assert report.dry_run is True
         assert not (tmp_path / "config.toml").exists()
         assert "x" in report.migrated
@@ -384,7 +417,7 @@ class TestMigrate:
                 },
             }
         }
-        report = migrate(hermes_cfg, codex_home=tmp_path)
+        report = migrate(hermes_cfg, codex_home=tmp_path, expose_hermes_tools=False)
         assert report.written
         text = (tmp_path / "config.toml").read_text()
         assert "[mcp_servers.filesystem]" in text
@@ -394,11 +427,11 @@ class TestMigrate:
 
     def test_idempotent_re_run_replaces_managed_block(self, tmp_path):
         # First migration
-        migrate({"mcp_servers": {"a": {"command": "x"}}}, codex_home=tmp_path)
+        migrate({"mcp_servers": {"a": {"command": "x"}}}, codex_home=tmp_path, expose_hermes_tools=False)
         first_text = (tmp_path / "config.toml").read_text()
         assert "[mcp_servers.a]" in first_text
         # Second migration with different servers
-        migrate({"mcp_servers": {"b": {"command": "y"}}}, codex_home=tmp_path)
+        migrate({"mcp_servers": {"b": {"command": "y"}}}, codex_home=tmp_path, expose_hermes_tools=False)
         second_text = (tmp_path / "config.toml").read_text()
         assert "[mcp_servers.a]" not in second_text
         assert "[mcp_servers.b]" in second_text
@@ -412,7 +445,7 @@ class TestMigrate:
             "[providers.openai]\n"
             'api_key = "sk-test"\n'
         )
-        migrate({"mcp_servers": {"a": {"command": "x"}}}, codex_home=tmp_path)
+        migrate({"mcp_servers": {"a": {"command": "x"}}}, codex_home=tmp_path, expose_hermes_tools=False)
         new_text = target.read_text()
         # User's codex config preserved
         assert "[model]" in new_text
@@ -430,25 +463,25 @@ class TestMigrate:
                     "sampling": {"enabled": True},  # codex has no equivalent
                 }
             }
-        }, codex_home=tmp_path)
+        }, codex_home=tmp_path, expose_hermes_tools=False)
         assert "x" in report.skipped_keys_per_server
         assert any("sampling" in s for s in report.skipped_keys_per_server["x"])
 
     def test_invalid_mcp_servers_value(self, tmp_path):
-        report = migrate({"mcp_servers": "notadict"}, codex_home=tmp_path)
+        report = migrate({"mcp_servers": "notadict"}, codex_home=tmp_path, expose_hermes_tools=False)
         assert any("not a dict" in e for e in report.errors)
 
     def test_server_without_transport_skipped_with_error(self, tmp_path):
         report = migrate({
             "mcp_servers": {"broken": {"description": "no command/url"}}
-        }, codex_home=tmp_path)
+        }, codex_home=tmp_path, expose_hermes_tools=False)
         assert "broken" not in report.migrated
         assert any("broken" in e for e in report.errors)
 
     def test_summary_reports_migration_count(self, tmp_path):
         report = migrate({
             "mcp_servers": {"a": {"command": "x"}, "b": {"command": "y"}}
-        }, codex_home=tmp_path)
+        }, codex_home=tmp_path, expose_hermes_tools=False)
         summary = report.summary()
         assert "Migrated 2 MCP server(s)" in summary
         assert "- a" in summary

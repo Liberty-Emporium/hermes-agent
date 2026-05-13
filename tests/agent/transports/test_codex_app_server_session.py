@@ -339,6 +339,47 @@ class TestServerRequestRouting:
             for (rid, code, _msg) in client.error_responses
         )
 
+    def test_mcp_elicitation_for_hermes_tools_auto_accepts(self):
+        """When codex elicits on behalf of hermes-tools (our own callback),
+        accept automatically — the user already opted in by enabling the
+        runtime."""
+        client = FakeClient()
+        client.queue_server_request(
+            "mcpServer/elicitation/request", request_id="elic-1",
+            threadId="t", turnId="tu1",
+            serverName="hermes-tools",
+            mode="form",
+            message="confirm",
+            requestedSchema={"type": "object", "properties": {}},
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(client)
+        s.run_turn("hi", turn_timeout=1.0)
+        assert ("elic-1", {"action": "accept", "content": None, "_meta": None}) in client.responses
+
+    def test_mcp_elicitation_for_other_servers_declines(self):
+        """For third-party MCP servers we decline by default so users
+        explicitly opt in through codex's own UI."""
+        client = FakeClient()
+        client.queue_server_request(
+            "mcpServer/elicitation/request", request_id="elic-2",
+            threadId="t", turnId="tu1",
+            serverName="some-third-party",
+            mode="url",
+            message="please log in",
+            url="https://example.com/oauth",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(client)
+        s.run_turn("hi", turn_timeout=1.0)
+        assert ("elic-2", {"action": "decline", "content": None, "_meta": None}) in client.responses
+
     def test_routing_auto_approve_bypass(self):
         client = FakeClient()
         client.queue_server_request("item/commandExecution/requestApproval", request_id="r1",

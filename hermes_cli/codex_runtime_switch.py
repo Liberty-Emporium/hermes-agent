@@ -192,33 +192,63 @@ def apply(
         ok, ver = _check_binary_cached()
         if ok:
             msg_lines.append(f"codex CLI: {ver}")
-        # Auto-migrate Hermes' MCP servers into ~/.codex/config.toml so
-        # the spawned codex subprocess sees the same tool surface. Failures
-        # here are non-fatal — the runtime change still proceeds.
+        # Auto-migrate Hermes' MCP servers + Codex's installed curated
+        # plugins into ~/.codex/config.toml so the spawned codex subprocess
+        # sees the same tool surface AND can call back into Hermes for
+        # browser/web/delegate_task/vision/memory tools (#7 fix).
+        # Failures are non-fatal — the runtime change still proceeds.
         try:
             from hermes_cli.codex_runtime_plugin_migration import migrate
             mig_report = migrate(config)
-            if mig_report.migrated:
+            # Tools/MCP servers (excluding the hermes-tools callback,
+            # which is internal plumbing — surface separately).
+            user_servers = [
+                s for s in mig_report.migrated if s != "hermes-tools"
+            ]
+            if user_servers:
                 msg_lines.append(
-                    f"Migrated {len(mig_report.migrated)} MCP server(s) "
-                    f"to {mig_report.target_path}"
+                    f"Migrated {len(user_servers)} MCP server(s): "
+                    f"{', '.join(user_servers)}"
                 )
-            elif mig_report.target_path:
+            # Native Codex plugin migration (Linear, GitHub, etc.)
+            if mig_report.migrated_plugins:
                 msg_lines.append(
-                    f"No MCP servers to migrate "
-                    f"(wrote placeholder to {mig_report.target_path})"
+                    f"Migrated {len(mig_report.migrated_plugins)} native "
+                    f"Codex plugin(s): {', '.join(mig_report.migrated_plugins)}"
                 )
+            elif mig_report.plugin_query_error:
+                msg_lines.append(
+                    f"Codex plugin discovery skipped: "
+                    f"{mig_report.plugin_query_error}"
+                )
+            # Permissions + Hermes tool callback are always-on production
+            # bits the user benefits from knowing about.
+            if mig_report.wrote_permissions_default:
+                msg_lines.append(
+                    f"Default sandbox: {mig_report.wrote_permissions_default} "
+                    f"(no approval prompt on every write)"
+                )
+            if "hermes-tools" in mig_report.migrated:
+                msg_lines.append(
+                    "Hermes tool callback registered: codex can now use "
+                    "web_search, web_extract, browser_*, vision_analyze, "
+                    "image_generate, skill_view, skills_list, text_to_speech "
+                    "via MCP."
+                )
+                msg_lines.append(
+                    "  (delegate_task, memory, session_search, todo run "
+                    "only on the default Hermes runtime — they need the "
+                    "agent loop context.)"
+                )
+            msg_lines.append(f"  (config: {mig_report.target_path})")
             for err in mig_report.errors:
                 msg_lines.append(f"⚠ MCP migration: {err}")
         except Exception as exc:
             msg_lines.append(f"⚠ MCP migration skipped: {exc}")
         msg_lines.append(
             "OpenAI/Codex turns now run through `codex app-server` "
-            "(terminal/file ops/patching inside Codex)."
-        )
-        msg_lines.append(
-            "Note: subagents (delegate_task) are unavailable on this "
-            "runtime. Use `/codex-runtime auto` to switch back."
+            "(terminal/file ops/patching inside Codex; "
+            "Hermes tools available via MCP callback)."
         )
         msg_lines.append(
             "Effective on next session — current cached agent keeps "
