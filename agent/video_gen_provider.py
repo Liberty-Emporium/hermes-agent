@@ -16,19 +16,16 @@ the two surfaces stay learnable together.
 
 Unified surface
 ---------------
-Video generation has more degrees of freedom than image generation, but the
-core ``video_generate`` tool keeps the schema minimal and uniform. Providers
-declare:
+One tool — ``video_generate`` — covers **text-to-video** and **image-to-video**.
+The router is the presence of ``image_url``: if it's set, the provider routes
+to its image-to-video endpoint; if it's omitted, the provider routes to
+text-to-video. Users pick one **model family** (e.g. Pixverse v6, Veo 3.1,
+Kling O3 Standard); the provider handles which underlying FAL/xAI endpoint
+to hit.
 
-- which **operations** they support (``generate`` / ``edit`` / ``extend``)
-- which **modalities** they support (text-to-video, image-to-video,
-  reference-images-to-video)
-- which **aspect ratios / resolutions / durations** they accept
-
-via :meth:`VideoGenProvider.capabilities`. The tool layer uses these to clamp
-or reject obviously-wrong calls before dispatch; providers are free to do
-their own clamping inside :meth:`generate`. Unknown ``**kwargs`` MUST be
-ignored — same forward-compat rule as image_gen.
+Video edit and video extend are intentionally NOT exposed in this surface —
+the inconsistency across backends is too large for one unified tool. If
+those use cases warrant attention later they can ship as separate tools.
 
 Response shape
 --------------
@@ -39,7 +36,7 @@ All providers return a dict built by :func:`success_response` /
     video           str | None      URL or absolute file path
     model           str             provider-specific model identifier
     prompt          str             echoed prompt
-    operation       str             "generate" | "edit" | "extend"
+    modality        str             "text" | "image" (which mode was used)
     aspect_ratio    str             provider-native (e.g. "16:9") or ""
     duration        int             seconds (0 if not applicable)
     provider        str             provider name (for diagnostics)
@@ -59,9 +56,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-
-VALID_OPERATIONS: Tuple[str, ...] = ("generate", "edit", "extend")
-DEFAULT_OPERATION = "generate"
 
 # Common aspect ratios across providers (Veo / Kling / xAI / Pixverse). The
 # tool schema advertises this set as an enum hint, but providers may accept
@@ -109,7 +103,8 @@ class VideoGenProvider(abc.ABC):
     def list_models(self) -> List[Dict[str, Any]]:
         """Return catalog entries for ``hermes tools`` model picker.
 
-        Each entry::
+        Each entry represents a **model family** that supports text-to-video
+        and/or image-to-video routing internally::
 
             {
                 "id": "veo-3.1",                       # required
@@ -117,8 +112,7 @@ class VideoGenProvider(abc.ABC):
                 "speed": "~60s",                       # optional
                 "strengths": "...",                    # optional
                 "price": "$0.20/s",                    # optional
-                "modalities": ["text", "image"],       # optional, info-only
-                "operations": ["generate"],            # optional, info-only
+                "modalities": ["text", "image"],       # optional, advisory
             }
 
         Default: empty list (provider has no user-selectable models).
@@ -147,11 +141,10 @@ class VideoGenProvider(abc.ABC):
         Returned dict (all keys optional)::
 
             {
-                "operations": ["generate", "edit", "extend"],
-                "modalities": ["text", "image", "reference_images"],
+                "modalities": ["text", "image"],      # which inputs the backend accepts
                 "aspect_ratios": ["16:9", "9:16", ...],
                 "resolutions": ["720p", "1080p"],
-                "max_duration": 15,             # seconds
+                "max_duration": 15,                   # seconds
                 "min_duration": 1,
                 "supports_audio": True,
                 "supports_negative_prompt": True,
@@ -159,10 +152,9 @@ class VideoGenProvider(abc.ABC):
             }
 
         Used by the tool layer for soft validation and by ``hermes tools``
-        for the picker. Default: generate + text only.
+        for the picker. Default: text-only.
         """
         return {
-            "operations": ["generate"],
             "modalities": ["text"],
             "aspect_ratios": list(COMMON_ASPECT_RATIOS),
             "resolutions": list(COMMON_RESOLUTIONS),
@@ -178,10 +170,8 @@ class VideoGenProvider(abc.ABC):
         self,
         prompt: str,
         *,
-        operation: str = DEFAULT_OPERATION,
         model: Optional[str] = None,
         image_url: Optional[str] = None,
-        video_url: Optional[str] = None,
         reference_image_urls: Optional[List[str]] = None,
         duration: Optional[int] = None,
         aspect_ratio: str = DEFAULT_ASPECT_RATIO,
@@ -191,7 +181,13 @@ class VideoGenProvider(abc.ABC):
         seed: Optional[int] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Generate, edit, or extend a video.
+        """Generate a video from a prompt (text-to-video) or animate an image
+        (image-to-video).
+
+        Routing: if ``image_url`` is provided, the provider should route to
+        its image-to-video endpoint; otherwise text-to-video. The plugin
+        is responsible for picking the right underlying endpoint within
+        the user's chosen model family.
 
         Implementations should return the dict from :func:`success_response`
         or :func:`error_response`. ``kwargs`` may contain forward-compat
@@ -203,33 +199,6 @@ class VideoGenProvider(abc.ABC):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def normalize_operation(value: Optional[str]) -> str:
-    """Clamp an operation value to the valid set, defaulting to generate.
-
-    Aliases (e.g. ``generate_video``) are accepted. Invalid values fall back
-    to ``generate`` rather than raising — same forgiving posture as
-    ``resolve_aspect_ratio`` on the image side.
-    """
-    if not isinstance(value, str):
-        return DEFAULT_OPERATION
-    v = value.strip().lower()
-    if not v:
-        return DEFAULT_OPERATION
-    aliases = {
-        "generate_video": "generate",
-        "text_to_video": "generate",
-        "txt2vid": "generate",
-        "edit_video": "edit",
-        "extend_video": "extend",
-        "continue": "extend",
-        "continuation": "extend",
-    }
-    v = aliases.get(v, v)
-    if v in VALID_OPERATIONS:
-        return v
-    return DEFAULT_OPERATION
 
 
 def _videos_cache_dir() -> Path:
@@ -280,7 +249,7 @@ def success_response(
     video: str,
     model: str,
     prompt: str,
-    operation: str,
+    modality: str = "text",
     aspect_ratio: str = "",
     duration: int = 0,
     provider: str,
@@ -289,13 +258,15 @@ def success_response(
     """Build a uniform success response dict.
 
     ``video`` may be an HTTP URL or an absolute filesystem path.
+    ``modality`` is ``"text"`` (text-to-video) or ``"image"`` (image-to-video) —
+    indicates which endpoint was actually hit, useful for diagnostics.
     """
     payload: Dict[str, Any] = {
         "success": True,
         "video": video,
         "model": model,
         "prompt": prompt,
-        "operation": operation,
+        "modality": modality,
         "aspect_ratio": aspect_ratio,
         "duration": int(duration) if duration else 0,
         "provider": provider,
@@ -313,7 +284,6 @@ def error_response(
     provider: str = "",
     model: str = "",
     prompt: str = "",
-    operation: str = DEFAULT_OPERATION,
     aspect_ratio: str = "",
 ) -> Dict[str, Any]:
     """Build a uniform error response dict."""
@@ -324,7 +294,6 @@ def error_response(
         "error_type": error_type,
         "model": model,
         "prompt": prompt,
-        "operation": operation,
         "aspect_ratio": aspect_ratio,
         "provider": provider,
     }

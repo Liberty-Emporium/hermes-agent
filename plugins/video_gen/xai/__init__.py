@@ -1,16 +1,14 @@
 """xAI Grok-Imagine video generation backend.
 
-Salvaged from PR #10600 (@Jaaneek) and reshaped into the
-:class:`VideoGenProvider` plugin interface. Original implementation kept
-intact for behavior — operation routing, payload shapes, polling, and
-edit/extend semantics all match #10600.
+Surface: text-to-video and image-to-video (animate an input image)
+through xAI's ``/videos/generations`` endpoint. Edit and extend are not
+exposed in this unified surface — xAI is the only backend that supports
+them and the inconsistency would force per-backend prose in the agent's
+tool description.
 
-Supports:
-    - text-to-video (operation='generate', prompt only)
-    - image-to-video (operation='generate', prompt + image_url)
-    - reference-image-guided generation (prompt + reference_image_urls)
-    - video edit (operation='edit', prompt + video_url)
-    - video extend (operation='extend', video_url, optional prompt)
+Originally salvaged from PR #10600 by @Jaaneek; reshaped into the
+:class:`VideoGenProvider` plugin interface and trimmed to the
+generate-only surface.
 
 Authentication via ``XAI_API_KEY``. Output is an HTTPS URL from xAI's
 CDN; the gateway downloads and delivers it.
@@ -27,7 +25,6 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from agent.video_gen_provider import (
-    DEFAULT_OPERATION,
     VideoGenProvider,
     error_response,
     success_response,
@@ -37,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Constants (mirrors PR #10600's tools/video_generation_tool.py)
+# Constants
 # ---------------------------------------------------------------------------
 
 DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
@@ -50,7 +47,6 @@ DEFAULT_POLL_INTERVAL_SECONDS = 5
 
 VALID_ASPECT_RATIOS = {"1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"}
 VALID_RESOLUTIONS = {"480p", "720p"}
-VALID_OPERATIONS = {"generate", "edit", "extend"}
 MAX_REFERENCE_IMAGES = 7
 
 
@@ -58,10 +54,9 @@ _MODELS: Dict[str, Dict[str, Any]] = {
     "grok-imagine-video": {
         "display": "Grok Imagine Video",
         "speed": "~60-240s",
-        "strengths": "Generate / edit / extend; reference images; image-to-video",
+        "strengths": "Text-to-video + image-to-video; up to 7 reference images for style/character.",
         "price": "see https://docs.x.ai/docs/models",
-        "modalities": ["text", "image", "reference_images"],
-        "operations": ["generate", "edit", "extend"],
+        "modalities": ["text", "image"],
     },
 }
 
@@ -79,8 +74,6 @@ def _xai_headers() -> Dict[str, str]:
     api_key = os.getenv("XAI_API_KEY", "").strip()
     if not api_key:
         raise ValueError("XAI_API_KEY not set. Get one at https://console.x.ai/")
-    # Lazy import — tools.xai_http is in-tree on main but we don't want to
-    # blow up if a downstream rearrangement moves it.
     try:
         from tools.xai_http import hermes_xai_user_agent
 
@@ -94,57 +87,34 @@ def _xai_headers() -> Dict[str, str]:
     }
 
 
-def _normalize_reference_images(
-    image_url: Optional[str],
-    reference_image_urls: Optional[List[str]],
-):
-    primary_image = None
-    if image_url and image_url.strip():
-        primary_image = {"url": image_url.strip()}
-
+def _normalize_reference_images(reference_image_urls: Optional[List[str]]):
     refs = []
     for url in reference_image_urls or []:
         normalized = (url or "").strip()
         if normalized:
             refs.append({"url": normalized})
-    return primary_image, refs or None
+    return refs or None
 
 
-def _clamp_duration(
-    *,
-    operation: str,
-    duration: Optional[int],
-    has_reference_images: bool,
-) -> int:
-    if operation == "edit":
-        # xAI inherits duration from the source video.
-        return DEFAULT_DURATION
-    value = duration if duration is not None else (6 if operation == "extend" else DEFAULT_DURATION)
+def _clamp_duration(duration: Optional[int], has_reference_images: bool) -> int:
+    value = duration if duration is not None else DEFAULT_DURATION
     if value < 1:
         value = 1
-    if operation == "extend":
-        if value > 10:
-            value = 10
-    else:
-        if value > 15:
-            value = 15
-        if has_reference_images and value > 10:
-            value = 10
+    if value > 15:
+        value = 15
+    if has_reference_images and value > 10:
+        value = 10
     return value
 
 
 async def _submit(
     client: httpx.AsyncClient,
-    operation: str,
     payload: Dict[str, Any],
 ) -> str:
-    endpoint_map = {
-        "generate": "videos/generations",
-        "edit": "videos/edits",
-        "extend": "videos/extensions",
-    }
+    """POST to /videos/generations — xAI's only public endpoint for our
+    text-to-video and image-to-video surface."""
     response = await client.post(
-        f"{_xai_base_url()}/{endpoint_map[operation]}",
+        f"{_xai_base_url()}/videos/generations",
         headers={**_xai_headers(), "x-idempotency-key": str(uuid.uuid4())},
         json=payload,
         timeout=60,
@@ -193,7 +163,7 @@ async def _poll(
 
 
 class XAIVideoGenProvider(VideoGenProvider):
-    """xAI grok-imagine-video backend."""
+    """xAI grok-imagine-video backend (text-to-video + image-to-video)."""
 
     @property
     def name(self) -> str:
@@ -216,7 +186,7 @@ class XAIVideoGenProvider(VideoGenProvider):
         return {
             "name": "xAI",
             "badge": "paid",
-            "tag": "grok-imagine-video — generate / edit / extend, image-to-video, reference images",
+            "tag": "grok-imagine-video — text-to-video & image-to-video with reference images",
             "env_vars": [
                 {
                     "key": "XAI_API_KEY",
@@ -228,8 +198,7 @@ class XAIVideoGenProvider(VideoGenProvider):
 
     def capabilities(self) -> Dict[str, Any]:
         return {
-            "operations": sorted(VALID_OPERATIONS),
-            "modalities": ["text", "image", "reference_images"],
+            "modalities": ["text", "image"],
             "aspect_ratios": sorted(VALID_ASPECT_RATIOS),
             "resolutions": sorted(VALID_RESOLUTIONS),
             "max_duration": 15,
@@ -243,10 +212,8 @@ class XAIVideoGenProvider(VideoGenProvider):
         self,
         prompt: str,
         *,
-        operation: str = DEFAULT_OPERATION,
         model: Optional[str] = None,
         image_url: Optional[str] = None,
-        video_url: Optional[str] = None,
         reference_image_urls: Optional[List[str]] = None,
         duration: Optional[int] = None,
         aspect_ratio: str = DEFAULT_ASPECT_RATIO,
@@ -256,17 +223,13 @@ class XAIVideoGenProvider(VideoGenProvider):
         seed: Optional[int] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        # Run the async implementation synchronously — the tool framework
-        # invokes provider.generate() inside its sync handler.
         try:
             loop = asyncio.new_event_loop()
             try:
                 return loop.run_until_complete(self._generate_async(
                     prompt=prompt,
-                    operation=operation,
                     model=model,
                     image_url=image_url,
-                    video_url=video_url,
                     reference_image_urls=reference_image_urls,
                     duration=duration,
                     aspect_ratio=aspect_ratio,
@@ -282,7 +245,6 @@ class XAIVideoGenProvider(VideoGenProvider):
                 provider="xai",
                 model=model or DEFAULT_MODEL,
                 prompt=prompt,
-                operation=operation,
                 aspect_ratio=aspect_ratio,
             )
 
@@ -290,129 +252,72 @@ class XAIVideoGenProvider(VideoGenProvider):
         self,
         *,
         prompt: str,
-        operation: str,
         model: Optional[str],
         image_url: Optional[str],
-        video_url: Optional[str],
         reference_image_urls: Optional[List[str]],
         duration: Optional[int],
         aspect_ratio: str,
         resolution: str,
     ) -> Dict[str, Any]:
-        if operation not in VALID_OPERATIONS:
-            return error_response(
-                error=f"xAI does not support operation '{operation}'",
-                error_type="unsupported_operation",
-                provider="xai",
-                prompt=prompt,
-                operation=operation,
-            )
-
         if not os.environ.get("XAI_API_KEY", "").strip():
             return error_response(
                 error="XAI_API_KEY not set. Get one at https://console.x.ai/",
                 error_type="auth_required",
-                provider="xai",
-                prompt=prompt,
-                operation=operation,
+                provider="xai", prompt=prompt,
             )
 
         prompt = (prompt or "").strip()
-        normalized_video_url = (video_url or "").strip() or None
+        image_url_norm = (image_url or "").strip() or None
         normalized_aspect_ratio = (aspect_ratio or DEFAULT_ASPECT_RATIO).strip()
         normalized_resolution = (resolution or DEFAULT_RESOLUTION).strip().lower()
-        notes: List[str] = []
+        modality_used = "image" if image_url_norm else "text"
 
-        if operation == "extend" and not prompt:
-            prompt = "Continue the existing video naturally."
-            notes.append("used default continuation prompt for extend")
-        if operation == "edit" and not prompt:
+        if not prompt:
             return error_response(
-                error="prompt is required for xAI video edit",
-                error_type="missing_prompt", provider="xai", operation=operation,
-            )
-        if operation == "generate" and not prompt and not (image_url or "").strip():
-            return error_response(
-                error="prompt or image_url is required for xAI text-to-video / image-to-video",
-                error_type="missing_prompt", provider="xai", operation=operation,
+                error=(
+                    "prompt is required for xAI video generation "
+                    "(text-to-video or image-to-video)"
+                ),
+                error_type="missing_prompt",
+                provider="xai", prompt=prompt,
             )
 
-        primary_image, refs = _normalize_reference_images(image_url, reference_image_urls)
+        refs = _normalize_reference_images(reference_image_urls)
         if refs and len(refs) > MAX_REFERENCE_IMAGES:
             return error_response(
                 error=f"reference_image_urls supports at most {MAX_REFERENCE_IMAGES} images on xAI",
-                error_type="too_many_references", provider="xai", operation=operation,
+                error_type="too_many_references",
+                provider="xai", prompt=prompt,
+            )
+        if image_url_norm and refs:
+            return error_response(
+                error="image_url and reference_image_urls cannot be combined on xAI",
+                error_type="conflicting_inputs",
+                provider="xai", prompt=prompt,
             )
 
-        clamped_duration = _clamp_duration(
-            operation=operation,
-            duration=duration,
-            has_reference_images=bool(refs),
-        )
+        clamped_duration = _clamp_duration(duration, has_reference_images=bool(refs))
 
-        payload: Dict[str, Any] = {"model": model or DEFAULT_MODEL}
-        if prompt:
-            payload["prompt"] = prompt
+        if normalized_aspect_ratio not in VALID_ASPECT_RATIOS:
+            normalized_aspect_ratio = DEFAULT_ASPECT_RATIO
+        if normalized_resolution not in VALID_RESOLUTIONS:
+            normalized_resolution = DEFAULT_RESOLUTION
 
-        if operation == "generate":
-            if normalized_aspect_ratio not in VALID_ASPECT_RATIOS:
-                # Soft-clamp instead of rejecting — keeps the tool surface
-                # forgiving when other providers pass through different
-                # ratios.
-                normalized_aspect_ratio = DEFAULT_ASPECT_RATIO
-            if normalized_resolution not in VALID_RESOLUTIONS:
-                normalized_resolution = DEFAULT_RESOLUTION
-            if primary_image and refs:
-                return error_response(
-                    error="image_url and reference_image_urls cannot be combined on xAI",
-                    error_type="conflicting_inputs",
-                    provider="xai", operation=operation,
-                )
-            payload.update({
-                "duration": clamped_duration,
-                "aspect_ratio": normalized_aspect_ratio,
-                "resolution": normalized_resolution,
-            })
-            if primary_image:
-                payload["image"] = primary_image
-            if refs:
-                payload["reference_images"] = refs
-
-        elif operation == "edit":
-            if not normalized_video_url:
-                return error_response(
-                    error="video_url is required for xAI video edit",
-                    error_type="missing_video_url",
-                    provider="xai", operation=operation,
-                )
-            if primary_image or refs:
-                return error_response(
-                    error="image_url and reference_image_urls are not supported for xAI video edit",
-                    error_type="unsupported_inputs",
-                    provider="xai", operation=operation,
-                )
-            payload["video"] = {"url": normalized_video_url}
-            notes.append("duration, aspect_ratio, resolution inherited from source video")
-
-        else:  # extend
-            if not normalized_video_url:
-                return error_response(
-                    error="video_url is required for xAI video extension",
-                    error_type="missing_video_url",
-                    provider="xai", operation=operation,
-                )
-            if primary_image or refs:
-                return error_response(
-                    error="image_url and reference_image_urls are not supported for xAI video extension",
-                    error_type="unsupported_inputs",
-                    provider="xai", operation=operation,
-                )
-            payload["duration"] = clamped_duration
-            payload["video"] = {"url": normalized_video_url}
+        payload: Dict[str, Any] = {
+            "model": model or DEFAULT_MODEL,
+            "prompt": prompt,
+            "duration": clamped_duration,
+            "aspect_ratio": normalized_aspect_ratio,
+            "resolution": normalized_resolution,
+        }
+        if image_url_norm:
+            payload["image"] = {"url": image_url_norm}
+        if refs:
+            payload["reference_images"] = refs
 
         async with httpx.AsyncClient() as client:
             try:
-                request_id = await _submit(client, operation, payload)
+                request_id = await _submit(client, payload)
             except httpx.HTTPStatusError as exc:
                 detail = ""
                 try:
@@ -422,7 +327,7 @@ class XAIVideoGenProvider(VideoGenProvider):
                 return error_response(
                     error=f"xAI submit failed ({exc.response.status_code}): {detail or exc}",
                     error_type="api_error",
-                    provider="xai", operation=operation,
+                    provider="xai",
                     model=model or DEFAULT_MODEL,
                     prompt=prompt,
                 )
@@ -443,24 +348,22 @@ class XAIVideoGenProvider(VideoGenProvider):
                 return error_response(
                     error="xAI video generation completed without a video URL",
                     error_type="empty_response",
-                    provider="xai", operation=operation,
+                    provider="xai",
                     model=body.get("model") or model or DEFAULT_MODEL,
                     prompt=prompt,
                 )
             extra: Dict[str, Any] = {
                 "request_id": request_id,
-                "resolution": normalized_resolution if operation == "generate" else None,
+                "resolution": normalized_resolution,
             }
-            if notes:
-                extra["notes"] = notes
             if body.get("usage"):
                 extra["usage"] = body["usage"]
             return success_response(
                 video=url,
                 model=body.get("model") or model or DEFAULT_MODEL,
                 prompt=prompt,
-                operation=operation,
-                aspect_ratio=normalized_aspect_ratio if operation == "generate" else "",
+                modality=modality_used,
+                aspect_ratio=normalized_aspect_ratio,
                 duration=video.get("duration") or clamped_duration,
                 provider="xai",
                 extra=extra,
@@ -470,7 +373,7 @@ class XAIVideoGenProvider(VideoGenProvider):
             return error_response(
                 error=f"Timed out waiting for video generation after {DEFAULT_TIMEOUT_SECONDS}s",
                 error_type="timeout",
-                provider="xai", operation=operation,
+                provider="xai",
                 model=model or DEFAULT_MODEL,
                 prompt=prompt,
             )
@@ -483,7 +386,7 @@ class XAIVideoGenProvider(VideoGenProvider):
         return error_response(
             error=message,
             error_type=f"xai_{status}",
-            provider="xai", operation=operation,
+            provider="xai",
             model=model or DEFAULT_MODEL,
             prompt=prompt,
         )

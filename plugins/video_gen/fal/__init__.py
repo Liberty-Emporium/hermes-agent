@@ -1,22 +1,22 @@
 """FAL.ai video generation backend.
 
-Multi-model FAL backend covering text-to-video and image-to-video. Models
-are user-selectable via ``hermes tools`` → Video Generation → FAL; the
-choice is persisted to ``video_gen.model`` in ``config.yaml``.
+User-facing surface: pick a **model family** (e.g. "Pixverse v6", "Veo 3.1",
+"Kling O3 Standard"). The plugin auto-routes to the family's
+text-to-video endpoint when called without ``image_url``, and to its
+image-to-video endpoint when ``image_url`` is provided. The agent never
+sees the routing — it just calls ``video_generate(prompt=..., image_url=...)``.
 
-Model catalog (curated initial set — more can be added without code
-changes by users via ``FAL_VIDEO_MODEL``):
+Model families (each with t2v + i2v endpoints):
 
-    fal-ai/veo3.1                                  Veo 3.1, text-to-video
-    fal-ai/veo3.1/image-to-video                   Veo 3.1, image-to-video
-    fal-ai/kling-video/o3/standard/image-to-video  Kling O3 standard i2v
-    fal-ai/pixverse/v6/image-to-video              Pixverse v6 i2v
+    veo3.1       fal-ai/veo3.1                                    /  fal-ai/veo3.1/image-to-video
+    pixverse-v6  fal-ai/pixverse/v6/text-to-video                 /  fal-ai/pixverse/v6/image-to-video
+    kling-o3     fal-ai/kling-video/o3/standard/text-to-video     /  fal-ai/kling-video/o3/standard/image-to-video
 
-Selection precedence:
+Selection precedence for the active family:
     1. ``model=`` arg from the tool call
     2. ``FAL_VIDEO_MODEL`` env var
     3. ``video_gen.fal.model`` in ``config.yaml``
-    4. ``video_gen.model`` in ``config.yaml`` (when it's one of our IDs)
+    4. ``video_gen.model`` in ``config.yaml`` (when it's one of our family IDs)
     5. ``DEFAULT_MODEL``
 
 Authentication via ``FAL_KEY``. Output is an HTTPS URL from FAL's CDN; the
@@ -30,7 +30,6 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.video_gen_provider import (
-    DEFAULT_OPERATION,
     VideoGenProvider,
     error_response,
     success_response,
@@ -40,101 +39,81 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Model catalog
+# Family catalog
 # ---------------------------------------------------------------------------
 #
-# Each entry declares:
-#   modality       : 'text' | 'image' | 'either'
-#   aspect_ratios  : tuple of supported ratios (None = model decides)
-#   resolutions    : tuple of supported resolutions (None = model decides)
+# Each family declares both endpoints (when available) plus a per-family
+# capability sheet derived from FAL's OpenAPI schemas. Capability flags
+# drive which keys get added to the request payload — keys a family doesn't
+# advertise are dropped before send.
+#
+# Capabilities:
+#   aspect_ratios  : tuple of supported ratios (None = endpoint decides)
+#   resolutions    : tuple of supported resolutions (None = endpoint decides)
 #   durations      : tuple of supported durations OR (min, max) range
+#                    (heuristic: 2-element with gap > 1 is a range)
 #   audio          : True if generate_audio is supported
 #   negative       : True if negative_prompt is supported
-#   refs           : True if reference_image is/are supported
-#
-# Capabilities here are derived from FAL's model pages. Models that lie
-# about their schema (or that FAL updates without notice) still work —
-# unknown keys get filtered by `_build_payload` per-model.
 
-FAL_MODELS: Dict[str, Dict[str, Any]] = {
-    "fal-ai/veo3.1": {
-        "display": "Veo 3.1 (text-to-video)",
+FAL_FAMILIES: Dict[str, Dict[str, Any]] = {
+    "veo3.1": {
+        "display": "Veo 3.1",
         "speed": "~60-120s",
         "price": "$0.20-0.40/s",
         "strengths": "Google DeepMind. Cinematic, native audio, strong prompt adherence.",
-        "modality": "text",
+        "text_endpoint": "fal-ai/veo3.1",
+        "image_endpoint": "fal-ai/veo3.1/image-to-video",
         "aspect_ratios": ("16:9", "9:16"),
         "resolutions": ("720p", "1080p"),
-        "durations": (4, 6, 8),
+        "durations": (4, 6, 8),  # enum
         "audio": True,
         "negative": True,
-        "refs": False,
     },
-    "fal-ai/veo3.1/image-to-video": {
-        "display": "Veo 3.1 (image-to-video)",
-        "speed": "~60-120s",
-        "price": "$0.20-0.40/s",
-        "strengths": "Animate an input image. Native audio support.",
-        "modality": "image",
-        "aspect_ratios": ("16:9", "9:16"),
-        "resolutions": ("720p", "1080p"),
-        "durations": (4, 6, 8),
+    "pixverse-v6": {
+        "display": "Pixverse v6",
+        "speed": "~30-90s",
+        "price": "$0.025-0.115/s",
+        "strengths": "Affordable. Negative prompts. 1-15s durations.",
+        "text_endpoint": "fal-ai/pixverse/v6/text-to-video",
+        "image_endpoint": "fal-ai/pixverse/v6/image-to-video",
+        "aspect_ratios": None,
+        "resolutions": ("360p", "540p", "720p", "1080p"),
+        "durations": (1, 15),  # range
         "audio": True,
         "negative": True,
-        "refs": False,
     },
-    "fal-ai/kling-video/o3/standard/image-to-video": {
-        "display": "Kling O3 Standard (image-to-video)",
+    "kling-o3-standard": {
+        "display": "Kling O3 Standard",
         "speed": "~60-180s",
         "price": "$0.20-0.40/s",
-        "strengths": "Start/end frame, multi-shot, native audio, 3-15s.",
-        "modality": "image",
+        "strengths": "Cinematic motion, multi-shot, native audio, 3-15s.",
+        "text_endpoint": "fal-ai/kling-video/o3/standard/text-to-video",
+        "image_endpoint": "fal-ai/kling-video/o3/standard/image-to-video",
         "aspect_ratios": None,
         "resolutions": ("720p", "1080p"),
         "durations": (3, 15),  # range
         "audio": True,
         "negative": True,
-        "refs": False,
-    },
-    "fal-ai/pixverse/v6/image-to-video": {
-        "display": "Pixverse v6 (image-to-video)",
-        "speed": "~30-90s",
-        "price": "$0.025-0.115/s",
-        "strengths": "Affordable. Negative prompts. 1-15s durations.",
-        "modality": "image",
-        "aspect_ratios": None,
-        "resolutions": ("360p", "540p", "720p", "1080p"),
-        "durations": (1, 15),
-        "audio": True,
-        "negative": True,
-        "refs": False,
     },
 }
 
-DEFAULT_MODEL = "fal-ai/veo3.1/image-to-video"
+DEFAULT_MODEL = "veo3.1"
 
 
 def _is_duration_range(durations: Any) -> bool:
-    """A tuple of exactly two integers is treated as ``(min, max)`` range."""
-    return (
-        isinstance(durations, tuple)
-        and len(durations) == 2
-        and all(isinstance(d, int) for d in durations)
-        and not (durations[0] in durations[1:])  # avoid collision with enum (a,b)
-    ) or (
-        isinstance(durations, tuple) and len(durations) == 2 and durations[0] < durations[1]
-        and durations[1] - durations[0] > 1  # heuristic: (3,15) is range, (4,8) is enum
-    )
+    """Heuristic: a 2-tuple of ints with a gap > 1 is treated as ``(min, max)``."""
+    if not isinstance(durations, tuple) or len(durations) != 2:
+        return False
+    if not all(isinstance(d, int) for d in durations):
+        return False
+    return durations[1] - durations[0] > 1
 
 
-def _clamp_duration(model_meta: Dict[str, Any], duration: Optional[int]) -> Optional[int]:
-    durations = model_meta.get("durations")
+def _clamp_duration(family: Dict[str, Any], duration: Optional[int]) -> Optional[int]:
+    durations = family.get("durations")
     if not durations:
         return duration
     if duration is None:
-        # default — pick the smallest supported
-        if _is_duration_range(durations):
-            return durations[0]
         return durations[0]
     if _is_duration_range(durations):
         lo, hi = durations
@@ -142,7 +121,6 @@ def _clamp_duration(model_meta: Dict[str, Any], duration: Optional[int]) -> Opti
     # enum
     if duration in durations:
         return duration
-    # snap to nearest enum value
     return min(durations, key=lambda d: abs(d - duration))
 
 
@@ -163,8 +141,8 @@ def _load_video_gen_section() -> Dict[str, Any]:
         return {}
 
 
-def _resolve_model(explicit: Optional[str]) -> Tuple[str, Dict[str, Any]]:
-    """Decide which FAL model to use. Returns ``(model_id, meta)``."""
+def _resolve_family(explicit: Optional[str]) -> Tuple[str, Dict[str, Any]]:
+    """Decide which FAL family to use. Returns ``(family_id, meta)``."""
     candidates: List[Optional[str]] = []
     candidates.append(explicit)
     candidates.append(os.environ.get("FAL_VIDEO_MODEL"))
@@ -178,11 +156,11 @@ def _resolve_model(explicit: Optional[str]) -> Tuple[str, Dict[str, Any]]:
         candidates.append(top)
 
     for c in candidates:
-        if isinstance(c, str) and c.strip() and c.strip() in FAL_MODELS:
-            mid = c.strip()
-            return mid, FAL_MODELS[mid]
+        if isinstance(c, str) and c.strip() and c.strip() in FAL_FAMILIES:
+            fid = c.strip()
+            return fid, FAL_FAMILIES[fid]
 
-    return DEFAULT_MODEL, FAL_MODELS[DEFAULT_MODEL]
+    return DEFAULT_MODEL, FAL_FAMILIES[DEFAULT_MODEL]
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +169,7 @@ def _resolve_model(explicit: Optional[str]) -> Tuple[str, Dict[str, Any]]:
 
 
 def _build_payload(
-    model_meta: Dict[str, Any],
+    family: Dict[str, Any],
     *,
     prompt: str,
     image_url: Optional[str],
@@ -202,12 +180,7 @@ def _build_payload(
     audio: Optional[bool],
     seed: Optional[int],
 ) -> Dict[str, Any]:
-    """Build a model-specific payload, dropping unsupported keys.
-
-    Mirrors the FAL_MODELS metadata: keys the model does not declare
-    support for are simply omitted (forward-compat with future FAL schema
-    changes — we never send rejected keys).
-    """
+    """Build a family-specific payload, dropping keys the family doesn't declare."""
     payload: Dict[str, Any] = {}
 
     if prompt:
@@ -217,28 +190,25 @@ def _build_payload(
     if seed is not None:
         payload["seed"] = seed
 
-    if model_meta.get("aspect_ratios"):
-        if aspect_ratio in model_meta["aspect_ratios"]:
+    if family.get("aspect_ratios"):
+        if aspect_ratio in family["aspect_ratios"]:
             payload["aspect_ratio"] = aspect_ratio
-        # otherwise let the model auto-crop / use its default
+        # otherwise let the endpoint auto-crop / use its default
 
-    if model_meta.get("resolutions"):
-        if resolution in model_meta["resolutions"]:
+    if family.get("resolutions"):
+        if resolution in family["resolutions"]:
             payload["resolution"] = resolution
-        # else: let the model default
+        # else: let the endpoint default
 
-    clamped = _clamp_duration(model_meta, duration)
-    if clamped is not None and model_meta.get("durations"):
-        # FAL's Veo and Kling/Pixverse both expose duration as a string in
-        # the queue API ("8" not 8). Keep it stringly typed for safety —
-        # the JSON serializer would have produced the same shape either
-        # way for new schemas.
+    clamped = _clamp_duration(family, duration)
+    if clamped is not None and family.get("durations"):
+        # FAL exposes duration as a string in the queue API ("8" not 8).
         payload["duration"] = str(clamped)
 
-    if model_meta.get("audio") and audio is not None:
+    if family.get("audio") and audio is not None:
         payload["generate_audio"] = bool(audio)
 
-    if model_meta.get("negative") and negative_prompt:
+    if family.get("negative") and negative_prompt:
         payload["negative_prompt"] = negative_prompt
 
     return payload
@@ -267,7 +237,11 @@ def _load_fal_client() -> Any:
 
 
 class FALVideoGenProvider(VideoGenProvider):
-    """FAL.ai multi-model video generation backend."""
+    """FAL.ai multi-family video generation backend.
+
+    Routes between text-to-video and image-to-video endpoints automatically
+    based on whether ``image_url`` was provided.
+    """
 
     @property
     def name(self) -> str:
@@ -288,19 +262,19 @@ class FALVideoGenProvider(VideoGenProvider):
 
     def list_models(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
-        for mid, meta in FAL_MODELS.items():
-            ops = ["generate"]
-            modalities = ["text"] if meta["modality"] == "text" else (
-                ["image"] if meta["modality"] == "image" else ["text", "image"]
-            )
+        for fid, meta in FAL_FAMILIES.items():
+            modalities: List[str] = []
+            if meta.get("text_endpoint"):
+                modalities.append("text")
+            if meta.get("image_endpoint"):
+                modalities.append("image")
             out.append({
-                "id": mid,
+                "id": fid,
                 "display": meta["display"],
                 "speed": meta["speed"],
                 "strengths": meta["strengths"],
                 "price": meta["price"],
                 "modalities": modalities,
-                "operations": ops,
             })
         return out
 
@@ -311,7 +285,7 @@ class FALVideoGenProvider(VideoGenProvider):
         return {
             "name": "FAL",
             "badge": "paid",
-            "tag": "Veo 3.1, Kling, Pixverse — text-to-video & image-to-video",
+            "tag": "Veo 3.1, Pixverse v6, Kling O3 — auto-routes text-to-video & image-to-video",
             "env_vars": [
                 {
                     "key": "FAL_KEY",
@@ -323,7 +297,6 @@ class FALVideoGenProvider(VideoGenProvider):
 
     def capabilities(self) -> Dict[str, Any]:
         return {
-            "operations": ["generate"],
             "modalities": ["text", "image"],
             "aspect_ratios": ["16:9", "9:16", "1:1"],
             "resolutions": ["360p", "540p", "720p", "1080p"],
@@ -338,10 +311,8 @@ class FALVideoGenProvider(VideoGenProvider):
         self,
         prompt: str,
         *,
-        operation: str = DEFAULT_OPERATION,
         model: Optional[str] = None,
         image_url: Optional[str] = None,
-        video_url: Optional[str] = None,
         reference_image_urls: Optional[List[str]] = None,
         duration: Optional[int] = None,
         aspect_ratio: str = "16:9",
@@ -351,18 +322,6 @@ class FALVideoGenProvider(VideoGenProvider):
         seed: Optional[int] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        if operation != "generate":
-            return error_response(
-                error=(
-                    f"FAL backend does not support operation='{operation}'. "
-                    f"For video edit/extend, switch to xAI via "
-                    f"`hermes tools` → Video Generation."
-                ),
-                error_type="unsupported_operation",
-                provider="fal", operation=operation,
-                prompt=prompt,
-            )
-
         if not os.environ.get("FAL_KEY", "").strip():
             return error_response(
                 error=(
@@ -370,7 +329,7 @@ class FALVideoGenProvider(VideoGenProvider):
                     "→ FAL to configure."
                 ),
                 error_type="auth_required",
-                provider="fal", operation=operation,
+                provider="fal",
                 prompt=prompt,
             )
 
@@ -380,35 +339,53 @@ class FALVideoGenProvider(VideoGenProvider):
             return error_response(
                 error="fal_client Python package not installed (pip install fal-client)",
                 error_type="missing_dependency",
-                provider="fal", operation=operation,
+                provider="fal",
                 prompt=prompt,
             )
 
         prompt = (prompt or "").strip()
-        model_id, meta = _resolve_model(model)
+        family_id, family = _resolve_family(model)
 
-        if meta["modality"] == "image" and not (image_url and image_url.strip()):
+        # Route: image_url → image-to-video endpoint; else → text-to-video.
+        image_url_norm = (image_url or "").strip() or None
+        if image_url_norm:
+            endpoint = family.get("image_endpoint")
+            modality_used = "image"
+            if not endpoint:
+                return error_response(
+                    error=(
+                        f"FAL family {family_id} has no image-to-video "
+                        f"endpoint. Pick a family with image-to-video support "
+                        f"via `hermes tools` → Video Generation."
+                    ),
+                    error_type="modality_unsupported",
+                    provider="fal", model=family_id, prompt=prompt,
+                )
+        else:
+            endpoint = family.get("text_endpoint")
+            modality_used = "text"
+            if not endpoint:
+                return error_response(
+                    error=(
+                        f"FAL family {family_id} has no text-to-video "
+                        f"endpoint. Pass an image_url to use its "
+                        f"image-to-video endpoint, or pick a different family."
+                    ),
+                    error_type="modality_unsupported",
+                    provider="fal", model=family_id, prompt=prompt,
+                )
+
+        if not prompt:
             return error_response(
-                error=(
-                    f"Model {model_id} is an image-to-video model; image_url "
-                    f"is required."
-                ),
-                error_type="missing_image_url",
-                provider="fal", operation=operation,
-                model=model_id, prompt=prompt,
-            )
-        if meta["modality"] == "text" and not prompt:
-            return error_response(
-                error=f"Model {model_id} is text-to-video; prompt is required.",
+                error="prompt is required.",
                 error_type="missing_prompt",
-                provider="fal", operation=operation,
-                model=model_id, prompt=prompt,
+                provider="fal", model=family_id, prompt=prompt,
             )
 
         payload = _build_payload(
-            meta,
+            family,
             prompt=prompt,
-            image_url=(image_url or "").strip() or None,
+            image_url=image_url_norm,
             duration=duration,
             aspect_ratio=aspect_ratio,
             resolution=resolution,
@@ -418,19 +395,20 @@ class FALVideoGenProvider(VideoGenProvider):
         )
 
         try:
-            os.environ["FAL_KEY"] = os.environ["FAL_KEY"]  # noqa: idempotent
             result = fal_client.subscribe(
-                model_id,
+                endpoint,
                 arguments=payload,
                 with_logs=False,
             )
         except Exception as exc:
-            logger.warning("FAL video gen failed (%s): %s", model_id, exc, exc_info=True)
+            logger.warning(
+                "FAL video gen failed (family=%s, endpoint=%s): %s",
+                family_id, endpoint, exc, exc_info=True,
+            )
             return error_response(
                 error=f"FAL video generation failed: {exc}",
                 error_type="api_error",
-                provider="fal", operation=operation,
-                model=model_id, prompt=prompt,
+                provider="fal", model=family_id, prompt=prompt,
                 aspect_ratio=aspect_ratio,
             )
 
@@ -445,11 +423,10 @@ class FALVideoGenProvider(VideoGenProvider):
             return error_response(
                 error="FAL returned no video URL in response",
                 error_type="empty_response",
-                provider="fal", operation=operation,
-                model=model_id, prompt=prompt,
+                provider="fal", model=family_id, prompt=prompt,
             )
 
-        extra: Dict[str, Any] = {}
+        extra: Dict[str, Any] = {"endpoint": endpoint}
         if isinstance(video, dict):
             if video.get("file_size"):
                 extra["file_size"] = video["file_size"]
@@ -458,9 +435,9 @@ class FALVideoGenProvider(VideoGenProvider):
 
         return success_response(
             video=url,
-            model=model_id,
+            model=family_id,
             prompt=prompt,
-            operation=operation,
+            modality=modality_used,
             aspect_ratio=aspect_ratio if "aspect_ratio" in payload else "",
             duration=int(payload["duration"]) if "duration" in payload else 0,
             provider="fal",

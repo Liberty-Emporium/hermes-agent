@@ -50,11 +50,8 @@ from agent.video_gen_provider import (
     COMMON_ASPECT_RATIOS,
     COMMON_RESOLUTIONS,
     DEFAULT_ASPECT_RATIO,
-    DEFAULT_OPERATION,
     DEFAULT_RESOLUTION,
-    VALID_OPERATIONS,
     error_response,
-    normalize_operation,
 )
 from tools.registry import registry, tool_error
 
@@ -65,8 +62,8 @@ VIDEO_GENERATE_SCHEMA: Dict[str, Any] = {
     "name": "video_generate",
     # Placeholder — the real description is built dynamically at
     # get_tool_definitions() time so it reflects the active backend's
-    # actual capabilities (which operations / modalities / resolutions /
-    # duration ranges the user's currently-selected model supports).
+    # actual capabilities (which modalities / resolutions / duration
+    # ranges the user's currently-selected model supports).
     # See _build_dynamic_video_schema() below and the dynamic-tool-schemas
     # skill at github/hermes-agent-dev/references/dynamic-tool-schemas.md.
     "description": "(rebuilt at get_definitions() time — see _build_dynamic_video_schema)",
@@ -77,36 +74,17 @@ VIDEO_GENERATE_SCHEMA: Dict[str, Any] = {
                 "type": "string",
                 "description": (
                     "Text instruction describing the desired video, motion, "
-                    "or edit. Required for generate and edit. Optional for "
-                    "extend (defaults to a natural continuation prompt)."
+                    "subject, style, camera movement, etc."
                 ),
-            },
-            "operation": {
-                "type": "string",
-                "enum": list(VALID_OPERATIONS),
-                "description": (
-                    "Which video operation to perform. 'generate' makes a new "
-                    "video from prompt (optionally seeded with image_url). "
-                    "'edit' modifies an existing video_url according to "
-                    "prompt. 'extend' continues an existing video_url. Not "
-                    "every provider supports every operation — providers "
-                    "surface a clear error when unsupported."
-                ),
-                "default": DEFAULT_OPERATION,
             },
             "image_url": {
                 "type": "string",
                 "description": (
-                    "Public URL of a still image to animate (image-to-video). "
-                    "Used with operation='generate'. Mutually exclusive with "
-                    "video_url."
-                ),
-            },
-            "video_url": {
-                "type": "string",
-                "description": (
-                    "Public URL of a source video for operation='edit' or "
-                    "operation='extend'."
+                    "Optional public URL of a still image. When provided, "
+                    "the active backend routes to its image-to-video "
+                    "endpoint (animate the image); when omitted, it routes "
+                    "to text-to-video. Pass either a URL the user supplied "
+                    "or a path/URL from the conversation."
                 ),
             },
             "reference_image_urls": {
@@ -114,8 +92,9 @@ VIDEO_GENERATE_SCHEMA: Dict[str, Any] = {
                 "items": {"type": "string"},
                 "description": (
                     "Optional list of reference image URLs (style or "
-                    "character refs). Provider-declared maximum applies — "
-                    "extras are rejected by the provider."
+                    "character refs). Only supported by some backends; "
+                    "the active backend's description below indicates whether "
+                    "this is honored and what the max is."
                 ),
             },
             "duration": {
@@ -330,9 +309,7 @@ def _normalize_reference_images(value: Any) -> Optional[List[str]]:
 
 def _handle_video_generate(args: Dict[str, Any], **_kw: Any) -> str:
     prompt = (args.get("prompt") or "").strip()
-    operation = normalize_operation(args.get("operation"))
     image_url = (args.get("image_url") or "").strip() or None
-    video_url = (args.get("video_url") or "").strip() or None
     reference_image_urls = _normalize_reference_images(args.get("reference_image_urls"))
     duration = _coerce_int(args.get("duration"))
     aspect_ratio = (args.get("aspect_ratio") or DEFAULT_ASPECT_RATIO).strip() or DEFAULT_ASPECT_RATIO
@@ -342,26 +319,11 @@ def _handle_video_generate(args: Dict[str, Any], **_kw: Any) -> str:
     seed = _coerce_int(args.get("seed"))
     model_override = (args.get("model") or "").strip() or None
 
-    # Soft validation — providers do their own, but obvious-wrong inputs
-    # get a friendly error before we dispatch.
-    if operation in ("generate", "edit") and not prompt:
-        # Image-to-video on grok-imagine / Pixverse can accept image-only,
-        # but the unified schema treats prompt as required (matches the
-        # tool schema's "required" key). Surface that clearly.
-        if operation == "generate" and (image_url or video_url):
-            # provider may accept this; let it through with empty prompt
-            pass
-        else:
-            return tool_error("prompt is required for video generation")
-
-    if operation == "extend" and not video_url:
-        return tool_error("video_url is required for operation='extend'")
-
-    if image_url and video_url:
-        return tool_error(
-            "image_url and video_url cannot be combined — image_url drives "
-            "image-to-video generate, video_url drives edit/extend"
-        )
+    # Soft validation — providers do their own. Prompt is required by the
+    # schema; the backend may still accept image-only on its image-to-video
+    # endpoint but our surface always needs a prompt.
+    if not prompt:
+        return tool_error("prompt is required for video generation")
 
     # Resolve the active provider.
     configured = _read_configured_video_provider()
@@ -373,10 +335,8 @@ def _handle_video_generate(args: Dict[str, Any], **_kw: Any) -> str:
     model = model_override or _read_configured_video_model() or provider.default_model()
 
     kwargs: Dict[str, Any] = {
-        "operation": operation,
         "model": model,
         "image_url": image_url,
-        "video_url": video_url,
         "reference_image_urls": reference_image_urls,
         "duration": duration,
         "aspect_ratio": aspect_ratio,
@@ -407,7 +367,6 @@ def _handle_video_generate(args: Dict[str, Any], **_kw: Any) -> str:
             provider=getattr(provider, "name", ""),
             model=model or "",
             prompt=prompt,
-            operation=operation,
         ))
     except Exception as exc:
         logger.warning(
@@ -420,7 +379,6 @@ def _handle_video_generate(args: Dict[str, Any], **_kw: Any) -> str:
             provider=getattr(provider, "name", ""),
             model=model or "",
             prompt=prompt,
-            operation=operation,
         ))
 
     if not isinstance(result, dict):
@@ -430,7 +388,6 @@ def _handle_video_generate(args: Dict[str, Any], **_kw: Any) -> str:
             provider=getattr(provider, "name", ""),
             model=model or "",
             prompt=prompt,
-            operation=operation,
         ))
 
     return json.dumps(result)
@@ -454,16 +411,16 @@ def _handle_video_generate(args: Dict[str, Any], **_kw: Any) -> str:
 
 
 _GENERIC_DESCRIPTION = (
-    "Generate, edit, or extend a video using the user's configured video "
-    "generation backend. One unified tool covers text-to-video, "
-    "image-to-video, video edit, and video extend; which of these the "
-    "active backend supports is described below. The backend and model "
-    "are user-configured via `hermes tools` → Video Generation; the agent "
-    "does not pick them. Long-running generations may take 30 seconds to "
-    "several minutes — the call blocks until the video is ready or the "
-    "provider's timeout elapses. Returns either an HTTP URL or an "
-    "absolute file path in the `video` field; display it with markdown "
-    "![description](url-or-path) and the gateway will deliver it."
+    "Generate a video from a text prompt (text-to-video) or animate a "
+    "still image (image-to-video) using the user's configured video "
+    "generation backend. Pass `image_url` to animate that image; omit it "
+    "to generate from text alone. The backend auto-routes to the right "
+    "endpoint. The backend and model family are user-configured via "
+    "`hermes tools` → Video Generation; the agent does not pick them. "
+    "Long-running generations may take 30 seconds to several minutes — "
+    "the call blocks until the video is ready. Returns either an HTTP "
+    "URL or an absolute file path in the `video` field; display it with "
+    "markdown ![description](url-or-path) and the gateway will deliver it."
 )
 
 
@@ -473,36 +430,24 @@ def _format_model_caveats(
 ) -> List[str]:
     """Pull human-readable caveats out of one model's catalog metadata.
 
-    Only surfaces things that meaningfully **differ from the backend's
-    overall capabilities** — repeating "operations: generate" when the
-    backend line already says the same thing is noise.
+    Only surfaces things that meaningfully differ from the backend's
+    overall capabilities — repeating defaults is noise.
     """
     caveats: List[str] = []
 
-    modalities = model_meta.get("modalities") or []
-    modality = model_meta.get("modality")  # FAL's plugin uses this key
+    modalities = set(model_meta.get("modalities") or [])
+    modality = model_meta.get("modality")  # FAL's plugin uses this key for single-modality entries
+    if modality:
+        modalities.add(modality)
 
     if "image" in modalities and "text" not in modalities:
         caveats.append(
-            "image-to-video only — image_url is REQUIRED; "
-            "text-only prompts will be rejected"
+            "this model is image-to-video only — image_url is REQUIRED; "
+            "text-only calls will be rejected"
         )
-    elif modality == "image":
+    elif "text" in modalities and "image" not in modalities:
         caveats.append(
-            "image-to-video only — image_url is REQUIRED; "
-            "text-only prompts will be rejected"
-        )
-    elif modality == "text":
-        caveats.append("text-to-video only — image_url is not supported")
-
-    # Model-level operations: only surface if they're narrower than the
-    # backend's overall set. A backend that says "generate, edit, extend"
-    # with a model that also supports all three doesn't need the repetition.
-    model_ops = set(model_meta.get("operations") or [])
-    backend_ops = set(backend_caps.get("operations") or [])
-    if model_ops and backend_ops and model_ops < backend_ops:
-        caveats.append(
-            f"this model supports only: {', '.join(sorted(model_ops))}"
+            "this model is text-to-video only — image_url is not supported"
         )
 
     return caveats
@@ -565,17 +510,19 @@ def _build_dynamic_video_schema() -> Dict[str, Any]:
         line += f" · model: {active_model}"
     parts.append(line)
 
-    # Model-specific caveats — the high-signal stuff that prevents wasted turns
-    caveats = _format_model_caveats(model_meta, caps)
-    for c in caveats:
+    # Model-specific caveats (the high-signal stuff)
+    for c in _format_model_caveats(model_meta, caps):
         parts.append(f"- {c}")
 
-    # Backend-wide capability summary (covers the cross-cutting flags)
-    ops = caps.get("operations") or ["generate"]
-    parts.append(f"- operations supported by this backend: {', '.join(sorted(ops))}")
-
-    modalities = caps.get("modalities") or ["text"]
-    parts.append(f"- modalities supported by this backend: {', '.join(sorted(modalities))}")
+    # Backend modality summary — only useful when the backend supports
+    # both text and image. Single-modality backends are already covered by
+    # the model caveat above.
+    modalities = set(caps.get("modalities") or [])
+    if "text" in modalities and "image" in modalities and not model_meta.get("modality"):
+        parts.append(
+            "- supports both text-to-video (omit image_url) and "
+            "image-to-video (pass image_url) — routes automatically"
+        )
 
     if caps.get("aspect_ratios"):
         parts.append(f"- aspect_ratio choices: {', '.join(caps['aspect_ratios'])}")
@@ -592,16 +539,6 @@ def _build_dynamic_video_schema() -> Dict[str, Any]:
     max_refs = caps.get("max_reference_images") or 0
     if max_refs:
         parts.append(f"- reference_image_urls: up to {max_refs} images")
-
-    # Cross-backend guidance: when the user wants something this backend
-    # can't do, tell the model how to escalate gracefully.
-    missing_ops = {"generate", "edit", "extend"} - set(ops)
-    if missing_ops:
-        parts.append(
-            f"- not supported on this backend: {', '.join(sorted(missing_ops))}. "
-            f"If the user asks for one of these, surface that they need to "
-            f"switch backends via `hermes tools` → Video Generation."
-        )
 
     return {"description": "\n".join(parts)}
 
