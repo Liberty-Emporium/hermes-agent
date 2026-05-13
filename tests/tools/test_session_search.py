@@ -1417,13 +1417,24 @@ class TestGuidedMode:
         # Description teaches the discover→drill flow
         desc = SESSION_SEARCH_SCHEMA["description"]
         assert "guided" in desc.lower()
-        assert "match_message_id" in desc
-        # Guided-mode-only parameters present
+        # match_message_id pairing guidance now lives on the anchors parameter
+        # (the only LLM-facing input to guided), not the top-level description.
         props = SESSION_SEARCH_SCHEMA["parameters"]["properties"]
-        assert "session_id" in props
-        assert "around_message_id" in props
-        assert "window" in props
+        assert "match_message_id" in props["anchors"]["description"]
+        # Guided-mode parameters: anchors + window. Single-anchor session_id /
+        # around_message_id were removed from the schema as part of the
+        # parameter-surface cleanup — guided always takes anchors=[...]
+        # from the LLM's perspective (1 anchor for single, N for multi).
+        # The Python function still accepts them as kwargs for back-compat.
         assert "anchors" in props
+        assert "window" in props
+        assert "session_id" not in props, (
+            "session_id was removed from the schema as part of the param-surface cleanup; "
+            "guided takes anchors=[...] only from the LLM"
+        )
+        assert "around_message_id" not in props, (
+            "around_message_id was removed from the schema as part of the param-surface cleanup"
+        )
 
 
 class TestGuidedModeMultiAnchor:

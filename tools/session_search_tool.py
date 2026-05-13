@@ -1029,28 +1029,23 @@ SESSION_SEARCH_SCHEMA = {
     "description": (
         "Search your long-term memory of past conversations, browse recent sessions, or drill "
         "into a specific session. This is your recall -- every past session is searchable.\n\n"
-        "MODES:\n"
-        "1. Recent sessions (no query): Call with no arguments to see what was worked on recently. "
-        "Returns titles, previews, and timestamps. Zero LLM cost, instant. "
-        "Start here when the user asks what were we working on or what did we do recently.\n"
-        "2. Keyword search (with query): Search for specific topics across all past sessions. "
-        "Defaults to mode='summary', returning LLM-generated recaps of the matched sessions (the recall "
-        "you usually want). Set mode='fast' for cheap, instant FTS snippet hits when you only need to "
-        "discover which sessions touched a topic. The default can be overridden per-user via "
-        "``tools.session_search.default_mode: fast`` in ~/.hermes/config.yaml — when no mode is passed "
-        "explicitly, that user-configured value applies (then 'summary' as the final fallback).\n"
-        "3. Drill-down (mode='guided'): When a fast-mode result looks promising but you need the "
-        "actual conversation around it, call again with mode='guided', session_id from the result, "
-        "and around_message_id=match_message_id from the same result. The pair (session_id, "
-        "match_message_id) is always self-consistent — pass them as-is, do NOT substitute "
-        "parent_session_id (which is shown for display context only and won't pair with the "
-        "match_message_id). Returns a window of messages around the anchor (no LLM, no truncation, "
-        "~ms latency).\n\n"
-        "RECOMMENDED FLOWS:\n"
-        "- 'what did we decide about X?' → mode='summary' (synthesised recall)\n"
-        "- 'find the latest session about Y' → mode='fast' (cheap discovery)\n"
-        "- 'I see the fast hit but want the actual back-and-forth' → mode='guided' "
-        "  with session_id+around_message_id from the fast hit\n\n"
+        "TWO STARTING MOVES + ONE FOLLOW-UP MOVE:\n"
+        "Starting moves (call with a ``query``):\n"
+        "  • mode='summary' (default) — LLM-generated recaps of the matched sessions. The recall "
+        "you usually want for 'what did we decide about X?' questions. ~30s, ~3-4 KB per session.\n"
+        "  • mode='fast' — FTS5 snippets + 1 message of context, no LLM call. ~10ms, ~1 KB per "
+        "session. Use for 'find the latest session about Y' — discovery, not synthesis.\n"
+        "Follow-up move (only useful AFTER a starting move identified the right anchor):\n"
+        "  • mode='guided' — given (session_id, message_id) pairs from prior fast-mode results, "
+        "returns a window of raw messages around each anchor. No LLM, no truncation, ~ms latency. "
+        "Cannot be a starting move on its own — it needs anchors, which come from fast.\n\n"
+        "Browsing recent sessions: call with NO arguments to see what was worked on recently. "
+        "Returns titles, previews, timestamps. Zero LLM cost, instant. Start here when the user "
+        "asks 'what were we working on' or 'what did we do recently'.\n\n"
+        "The default mode is configurable per-user via "
+        "``tools.session_search.default_mode: fast`` in ~/.hermes/config.yaml. When no mode is "
+        "passed explicitly, that user-configured value applies (then 'summary' as the final "
+        "fallback).\n\n"
         "USE THIS PROACTIVELY when:\n"
         "- The user says 'we did this before', 'remember when', 'last time', 'as I mentioned'\n"
         "- The user asks about a topic you worked on before but don't have in current context\n"
@@ -1086,32 +1081,16 @@ SESSION_SEARCH_SCHEMA = {
                 "type": "string",
                 "enum": ["fast", "summary", "guided"],
                 "description": (
-                    "summary (default) loads each matched session's transcript and runs the LLM "
-                    "summariser to produce a focused recap — ~30s, ~3-4 KB returned per session, "
-                    "surfaces cross-session synthesis (e.g. references to work sessions that didn't "
-                    "themselves match FTS5). Use this when the user wants to know WHAT HAPPENED in "
-                    "past sessions about a topic. "
-                    "fast returns FTS5 snippets + 1-message context without any LLM call — ~10ms, "
-                    "~1 KB per session, surfaces only what FTS5 directly matched. Use this when the "
-                    "user only needs to discover WHICH SESSIONS touched a topic, or when you'll "
-                    "drill into specific sessions yourself afterwards (then call again with mode='guided'). "
-                    "guided returns a window of messages around a specific anchor in a specific session "
-                    "— no LLM call, no truncation, ~ms latency. Requires session_id and "
-                    "around_message_id (typically copied from a prior fast hit's match_message_id field)."
+                    "summary (default) — LLM recap of each matched session. fast — FTS5 snippets, "
+                    "no LLM, ~10ms. guided — given anchors from a prior fast hit, returns raw "
+                    "message windows; cannot be a starting move (always follows fast or summary). "
+                    "See the tool description for when to use which."
                 ),
                 "default": "summary",
             },
-            "session_id": {
-                "type": "string",
-                "description": "Single-anchor mode='guided'. The session to drill into. Copy from a prior fast-mode result. Use this OR 'anchors' (not both).",
-            },
-            "around_message_id": {
-                "type": "integer",
-                "description": "Single-anchor mode='guided'. The message id to anchor the window on. Copy from a prior fast-mode result's match_message_id field. Use this OR 'anchors' (not both).",
-            },
             "anchors": {
                 "type": "array",
-                "description": "Multi-anchor mode='guided'. A list of {session_id, around_message_id} dicts to drill into all at once. Use this when a wider fast call returned multiple promising hits and the user (or you) wants to inspect several at the same time. Each anchor produces its own window in the response's 'windows' array.",
+                "description": "Required for mode='guided'. List of {session_id, around_message_id} dicts to drill into. Copy session_id and match_message_id verbatim from prior fast-mode results — they pair as a single self-consistent handle. Do NOT substitute parent_session_id (shown for display context only; pairs incorrectly with match_message_id). One anchor is fine for single drills; multiple anchors get drilled in one call and one window per anchor is returned.",
                 "items": {
                     "type": "object",
                     "properties": {
