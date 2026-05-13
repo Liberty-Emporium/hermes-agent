@@ -23,6 +23,62 @@ from typing import Dict, Any, List, Optional, Union
 
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 MAX_SESSION_CHARS = 100_000
+
+
+# Default mode is summary unless the user opts into a different one via
+# ``tools.session_search.default_mode`` in ~/.hermes/config.yaml. Only ``fast``
+# and ``summary`` are valid defaults — guided requires anchors and can't be
+# used standalone. Wrapped in lru_cache so the YAML read happens at most once
+# per process; the CLI / TUI is the typical caller and config changes need a
+# restart anyway.
+_VALID_DEFAULT_MODES = ("fast", "summary")
+
+
+def _resolve_user_default_mode() -> str:
+    """Look up ``tools.session_search.default_mode`` from ~/.hermes/config.yaml.
+
+    Returns "summary" if unset, invalid, or the config loader is unavailable
+    (e.g. tests, tools loaded outside the CLI). Logs a one-time warning on
+    invalid values so users get feedback when they typo their config.
+    """
+    try:
+        from hermes_cli.config import load_config
+        config = load_config() or {}
+    except ImportError:
+        logging.debug("hermes_cli.config not available; default_mode falls back to 'summary'")
+        return "summary"
+    except Exception as e:
+        logging.debug("Failed to load config for session_search default_mode: %s", e, exc_info=True)
+        return "summary"
+
+    raw = (
+        config.get("tools", {})
+        .get("session_search", {})
+        .get("default_mode")
+    )
+    if raw is None:
+        return "summary"
+    if not isinstance(raw, str):
+        logging.warning(
+            "tools.session_search.default_mode in config.yaml must be a string, got %r — falling back to 'summary'",
+            raw,
+        )
+        return "summary"
+    normalised = raw.strip().lower()
+    if normalised not in _VALID_DEFAULT_MODES:
+        logging.warning(
+            "tools.session_search.default_mode=%r is not one of %s — falling back to 'summary'. "
+            "(guided requires anchors and cannot be a default.)",
+            raw, _VALID_DEFAULT_MODES,
+        )
+        return "summary"
+    return normalised
+
+
+# Process-level cache so repeated session_search calls don't re-read YAML.
+# Cleared by tests via _resolve_user_default_mode.cache_clear() when needed.
+import functools  # noqa: E402  — local to the cache wrap
+_resolve_user_default_mode = functools.lru_cache(maxsize=1)(_resolve_user_default_mode)
 MAX_SUMMARY_TOKENS = 10000
 
 
@@ -671,7 +727,15 @@ def session_search(
             from hermes_state import format_session_db_unavailable
             return tool_error(format_session_db_unavailable(), success=False)
 
-    mode = (mode or "summary").strip().lower() if isinstance(mode, str) else "summary"
+    # Mode normalisation. ``None`` / empty string / non-string → fall back to
+    # the user's configured default (via ~/.hermes/config.yaml, see
+    # ``_resolve_user_default_mode``). Defaults to "summary" if unset. We only
+    # resolve the user default when the caller didn't pass an explicit mode —
+    # an explicit "fast" or "summary" or "guided" wins regardless of config.
+    if not isinstance(mode, str) or not mode.strip():
+        mode = _resolve_user_default_mode()
+    else:
+        mode = mode.strip().lower()
     if mode in ("summarized", "summarise", "summarize", "deep"):
         mode = "summary"
     if mode in ("drill", "drilldown", "drill-down", "anchor", "around"):
@@ -972,7 +1036,9 @@ SESSION_SEARCH_SCHEMA = {
         "2. Keyword search (with query): Search for specific topics across all past sessions. "
         "Defaults to mode='summary', returning LLM-generated recaps of the matched sessions (the recall "
         "you usually want). Set mode='fast' for cheap, instant FTS snippet hits when you only need to "
-        "discover which sessions touched a topic.\n"
+        "discover which sessions touched a topic. The default can be overridden per-user via "
+        "``tools.session_search.default_mode: fast`` in ~/.hermes/config.yaml — when no mode is passed "
+        "explicitly, that user-configured value applies (then 'summary' as the final fallback).\n"
         "3. Drill-down (mode='guided'): When a fast-mode result looks promising but you need the "
         "actual conversation around it, call again with mode='guided', session_id from the result, "
         "and around_message_id=match_message_id from the same result. The pair (session_id, "

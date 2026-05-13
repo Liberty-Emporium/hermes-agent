@@ -633,17 +633,153 @@ class TestSessionSearch:
         mock_db.search_messages.assert_called_once()
 
     def test_run_agent_special_session_search_paths_forward_mode(self):
-        """run_agent has two direct session_search call sites outside registry dispatch."""
+        """run_agent has two direct session_search call sites outside registry dispatch.
+
+        Both dispatch sites now pass ``mode=function_args.get("mode")`` (no
+        hardcoded "summary" fallback) so that an unset mode flows through to
+        the tool's normaliser, which resolves the user-configured default via
+        ``_resolve_user_default_mode()``. Hardcoding "summary" at the dispatch
+        layer would silently shadow that config.
+        """
         from pathlib import Path
 
         source = (Path(__file__).parent.parent.parent / "run_agent.py").read_text()
         # Both dispatch sites pass mode= as their next-to-last group of kwargs;
         # the new guided-mode kwargs (session_id/around_message_id/window) follow.
-        assert source.count('mode=function_args.get("mode", "summary")') == 2
+        assert source.count('mode=function_args.get("mode")') == 2
         # And both dispatch sites carry the guided-mode handles
         assert source.count('around_message_id=function_args.get("around_message_id")') == 2
         assert source.count('window=function_args.get("window", 5)') == 2
         assert source.count('anchors=function_args.get("anchors")') == 2
+        # Guard against a regression to hardcoded "summary" — the config-default
+        # plumbing only works if dispatch doesn't shadow None with "summary".
+        assert 'mode=function_args.get("mode", "summary")' not in source, (
+            "dispatch sites must pass mode=function_args.get(\"mode\") (no default) "
+            "so the user-configured default_mode can take effect"
+        )
+
+    # -----------------------------------------------------------------
+    # User-configurable default mode (tools.session_search.default_mode
+    # in ~/.hermes/config.yaml). Lets a user opt into fast-as-default
+    # without having to pass mode= on every call.
+    # -----------------------------------------------------------------
+
+    def _clear_default_mode_cache(self):
+        """Reset the lru_cache between tests so config changes are honoured."""
+        from tools.session_search_tool import _resolve_user_default_mode
+        _resolve_user_default_mode.cache_clear()
+
+    def test_unset_mode_falls_back_to_summary_when_config_missing(self, monkeypatch):
+        """With no config, an unset mode resolves to 'summary'."""
+        from tools.session_search_tool import _resolve_user_default_mode
+        self._clear_default_mode_cache()
+        # Force load_config import to fail → fallback path.
+        import sys
+        monkeypatch.setitem(sys.modules, "hermes_cli.config", None)
+        assert _resolve_user_default_mode() == "summary"
+
+    def test_user_can_configure_fast_as_default(self, monkeypatch):
+        """tools.session_search.default_mode: fast → unset mode resolves to 'fast'."""
+        from tools.session_search_tool import _resolve_user_default_mode
+        self._clear_default_mode_cache()
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"tools": {"session_search": {"default_mode": "fast"}}},
+        )
+        assert _resolve_user_default_mode() == "fast"
+
+    def test_user_can_configure_summary_as_default_explicitly(self, monkeypatch):
+        """Explicit summary in config behaves identically to the implicit default."""
+        from tools.session_search_tool import _resolve_user_default_mode
+        self._clear_default_mode_cache()
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"tools": {"session_search": {"default_mode": "summary"}}},
+        )
+        assert _resolve_user_default_mode() == "summary"
+
+    def test_invalid_default_mode_warns_and_falls_back(self, monkeypatch, caplog):
+        """Typo'd / unknown value logs a warning and falls back to 'summary'."""
+        from tools.session_search_tool import _resolve_user_default_mode
+        import logging
+        self._clear_default_mode_cache()
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"tools": {"session_search": {"default_mode": "smary"}}},
+        )
+        with caplog.at_level(logging.WARNING):
+            assert _resolve_user_default_mode() == "summary"
+        # User sees feedback about the typo.
+        assert any("smary" in rec.message for rec in caplog.records)
+
+    def test_guided_as_default_mode_is_rejected(self, monkeypatch):
+        """guided requires anchors and can't be a standalone default — falls back to 'summary'."""
+        from tools.session_search_tool import _resolve_user_default_mode
+        self._clear_default_mode_cache()
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"tools": {"session_search": {"default_mode": "guided"}}},
+        )
+        assert _resolve_user_default_mode() == "summary"
+
+    def test_non_string_default_mode_falls_back(self, monkeypatch):
+        """Bogus types (int, dict, etc.) in YAML fall back gracefully, no crash."""
+        from tools.session_search_tool import _resolve_user_default_mode
+        self._clear_default_mode_cache()
+        for bad in (42, ["fast"], {"mode": "fast"}, True):
+            monkeypatch.setattr(
+                "hermes_cli.config.load_config",
+                lambda b=bad: {"tools": {"session_search": {"default_mode": b}}},
+            )
+            self._clear_default_mode_cache()
+            assert _resolve_user_default_mode() == "summary", f"bad value {bad!r} should fall back"
+
+    def test_explicit_mode_argument_overrides_user_default(self, monkeypatch):
+        """User config sets fast-as-default, but explicit mode='summary' still wins."""
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        self._clear_default_mode_cache()
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"tools": {"session_search": {"default_mode": "fast"}}},
+        )
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = []
+
+        result = json.loads(session_search(query="anything", db=mock_db, mode="fast"))
+        assert result["mode"] == "fast"
+        # ...and explicit summary still produces summary even when default is fast.
+        result = json.loads(session_search(query="anything", db=mock_db, mode="summary"))
+        assert result["mode"] == "summary"
+
+    def test_unset_mode_with_config_default_fast_runs_fast_path(self, monkeypatch):
+        """End-to-end: config says default=fast, caller passes mode=None → fast hits returned, no LLM."""
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        self._clear_default_mode_cache()
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"tools": {"session_search": {"default_mode": "fast"}}},
+        )
+
+        async def fail_summarize(*_args, **_kwargs):
+            raise AssertionError("fast mode must not invoke the summariser")
+        monkeypatch.setattr("tools.session_search_tool._summarize_session", fail_summarize)
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {"session_id": "sid", "id": 7, "content": "match", "source": "cli",
+             "session_started": 1709400000, "model": "test"},
+        ]
+        mock_db.get_session.return_value = {"id": "sid", "parent_session_id": None,
+                                              "source": "cli", "started_at": 1709400000}
+
+        # mode=None mimics what the dispatcher passes when the LLM omits 'mode'.
+        result = json.loads(session_search(query="match", db=mock_db, mode=None))
+        assert result["mode"] == "fast"
+        assert result["count"] == 1
 
     def test_current_child_session_excludes_parent_lineage(self):
         """Compression/delegation parents should be excluded for the active child session."""
