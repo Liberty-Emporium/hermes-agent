@@ -307,7 +307,11 @@ class TestServerRequestRouting:
         client = FakeClient()
         client.queue_server_request(
             "item/fileChange/requestApproval", request_id="req-2",
-            changes=[{"kind": {"type": "add"}, "path": "/tmp/x"}],
+            itemId="fc-1",
+            turnId="t1",
+            threadId="th",
+            startedAtMs=1234567890,
+            reason="create new file with hello() function",
         )
         client.queue_notification(
             "turn/completed", threadId="t",

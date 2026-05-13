@@ -357,11 +357,19 @@ class CodexAppServerSession:
         if self._routing.auto_approve_apply_patch:
             return "accept"
         if self._approval_callback is not None:
-            n_changes = len(params.get("changes") or [])
+            # Codex's FileChangeRequestApprovalParams only carries itemId/turnId/
+            # threadId/reason/grantRoot — NOT the changeset. (The changes array
+            # lives on the corresponding fileChange item, which we project on
+            # item/completed.) Display whatever context codex hands us.
+            reason = params.get("reason") or "apply file changes"
+            grant_root = params.get("grantRoot")
+            description = f"Codex requests to apply a patch ({reason})"
+            if grant_root:
+                description += f" — grants write to {grant_root}"
             try:
                 choice = self._approval_callback(
-                    f"apply_patch ({n_changes} change(s))",
-                    "Codex requests to apply a patch",
+                    f"apply_patch: {reason}",
+                    description,
                     allow_permanent=False,
                 )
                 return _approval_choice_to_codex_decision(choice)
