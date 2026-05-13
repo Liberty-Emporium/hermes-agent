@@ -745,7 +745,7 @@ def session_search(
     limit: int = 3,
     db=None,
     current_session_id: str = None,
-    mode: str = "summary",
+    mode: str = None,
     # Guided-mode-only parameters: anchored drill-down into one or more
     # session+message pairs. Required when mode='guided', ignored otherwise.
     # Use either the single-anchor pair (session_id + around_message_id) or
@@ -1209,7 +1209,7 @@ registry.register(
         query=args.get("query") or "",
         role_filter=args.get("role_filter"),
         limit=args.get("limit", 3),
-        mode=args.get("mode", "summary"),
+        mode=args.get("mode"),
         session_id=args.get("session_id"),
         around_message_id=args.get("around_message_id"),
         window=args.get("window", 5),

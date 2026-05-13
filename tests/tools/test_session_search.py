@@ -741,6 +741,62 @@ class TestSessionSearch:
             "so the user-configured default_mode can take effect"
         )
 
+    def test_registry_handler_forwards_unset_mode_without_default(self):
+        """Registry handler must pass mode=args.get("mode") (no "summary" fallback).
+
+        If the handler substitutes "summary" when the LLM omits ``mode``, then
+        ``_resolve_user_default_mode()`` is structurally unreachable from real
+        tool calls and the ``tools.session_search.default_mode`` config knob
+        becomes dead code. This is the registry-handler counterpart to
+        ``test_run_agent_special_session_search_paths_forward_mode``.
+        """
+        from pathlib import Path
+
+        source = (
+            Path(__file__).parent.parent.parent / "tools" / "session_search_tool.py"
+        ).read_text()
+        assert 'mode=args.get("mode")' in source, (
+            "registry handler must pass mode=args.get(\"mode\") (no default) "
+            "so the user-configured default_mode can take effect"
+        )
+        assert 'mode=args.get("mode", "summary")' not in source, (
+            "registry handler must not hardcode \"summary\" as the mode default — "
+            "it shadows tools.session_search.default_mode in config.yaml"
+        )
+
+    def test_unset_mode_via_registry_honours_configured_default(self, monkeypatch):
+        """End-to-end: unset mode through the registry handler resolves to config.
+
+        With ``tools.session_search.default_mode: fast`` configured, an LLM tool
+        call that omits ``mode`` must run in fast mode (no aux LLM), not summary.
+        This is the regression test for the bug where three layers of hardcoded
+        ``"summary"`` defaults made the config knob unreachable.
+        """
+        from unittest.mock import MagicMock
+        from tools.registry import registry
+        from tools.session_search_tool import _resolve_user_default_mode
+
+        self._clear_default_mode_cache()
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"tools": {"session_search": {"default_mode": "fast"}}},
+        )
+        # Sanity: the resolver itself sees fast.
+        assert _resolve_user_default_mode() == "fast"
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = []
+
+        # Invoke through the registry exactly as the agent loop would, with no
+        # "mode" in args — simulates the LLM omitting the parameter.
+        result = json.loads(registry.dispatch("session_search", {"query": "anything"}, db=mock_db))
+
+        assert result["success"] is True
+        assert result["mode"] == "fast", (
+            f"expected fast (from config), got {result['mode']!r} — "
+            "the registry handler is shadowing the configured default"
+        )
+
     # -----------------------------------------------------------------
     # User-configurable default mode (tools.session_search.default_mode
     # in ~/.hermes/config.yaml). Lets a user opt into fast-as-default
