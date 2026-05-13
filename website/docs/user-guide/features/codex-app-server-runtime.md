@@ -23,12 +23,12 @@ This is the part most users want to know up front. When this runtime is on, the 
 
 ### 1. Codex's built-in toolset (always on)
 
-These come with `codex app-server` itself — no Hermes involvement, no MCP, no plugins:
+These ship with `codex app-server` itself — no Hermes involvement, no MCP, no plugins. All five are available the moment the runtime starts:
 
 - **`shell`** — runs arbitrary shell commands inside the sandbox. This is how the model reads files (`cat`, `head`, `tail`), writes them (`echo > foo`, heredocs), searches them (`find`, `rg`, `grep`), navigates directories (`ls`, `cd`), runs builds, manages processes, and anything else you'd do in bash.
 - **`apply_patch`** — applies a structured multi-file diff in Codex's patch format. The model uses this for non-trivial code edits (adding a function, refactoring across files); shell heredocs are still available for one-off writes.
-- **`update_plan`** — codex's internal todo/plan tracker. Equivalent to Hermes' `todo` tool but managed by codex's runtime.
-- **`view_image`** — load a local image into the conversation so the model can see it.
+- **`update_plan`** — codex's internal todo / plan tracker. Equivalent of Hermes' `todo` tool, but managed entirely inside codex's runtime.
+- **`view_image`** — load a local image file into the conversation so the model can see it.
 - **`web_search`** — codex has its own built-in web search when configured. Hermes also exposes `web_search` (Firecrawl-backed) via the callback below; the model picks whichever it prefers.
 
 So **anything you'd do via terminal — read/write/search/find/run — codex does natively**. The sandbox profile (`:workspace` by default when you enable the runtime) controls what's writable.
@@ -146,6 +146,29 @@ You can also set it manually in `~/.hermes/config.yaml`:
 model:
   openai_runtime: codex_app_server   # default is "auto" (= Hermes runtime)
 ```
+
+## Self-improvement loop (memory + skill nudges)
+
+Hermes' background self-improvement fires on counter thresholds:
+
+- Every 10 user prompts → a forked review agent looks at the conversation and decides whether anything should be saved to memory.
+- Every 10 tool iterations within a single turn → same idea but for skills (`skill_manage` writes).
+
+**Both keep working on the codex runtime.** The codex path projects each completed `commandExecution` / `fileChange` / `mcpToolCall` / `dynamicToolCall` item into a synthetic `assistant tool_call` + `tool` result message, so by the time the review runs it sees the same shape it sees on the default Hermes runtime.
+
+How the wiring stays equivalent:
+
+| | Default runtime | Codex runtime |
+|---|---|---|
+| `_turns_since_memory` increments | per user prompt, in run_conversation pre-loop | same code path, before the early-return |
+| `_iters_since_skill` increments | per tool iteration in the chat-completions loop | by `turn.tool_iterations` after the codex turn returns |
+| Memory trigger (`_turns_since_memory >= _memory_nudge_interval`) | computed in pre-loop, fires after response | computed in pre-loop, passed through to codex helper |
+| Skill trigger (`_iters_since_skill >= _skill_nudge_interval`) | computed after the loop | computed after the codex turn |
+| `_spawn_background_review(messages_snapshot=..., review_memory=..., review_skills=...)` | called when either trigger fires | called identically when either trigger fires |
+
+One detail: the review fork itself needs to call Hermes' agent-loop tools (`memory`, `skill_manage`), which require Hermes' own dispatch. So when the parent agent is on `codex_app_server`, the review fork is **downgraded to `codex_responses`** — same OAuth credentials, same `openai-codex` provider, but talks to OpenAI's Responses API directly so Hermes owns the loop and the agent-loop tools work. This is invisible to the user.
+
+Net effect: enable the codex runtime and your memory + skill nudges keep firing exactly as they would otherwise.
 
 ## How approvals work
 

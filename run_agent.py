@@ -4285,13 +4285,24 @@ class AIAgent:
                     # reconstruct auth from scratch -- producing the spurious
                     # "No LLM provider configured" warning at end of turn.
                     _parent_runtime = self._current_main_runtime()
+                    _parent_api_mode = _parent_runtime.get("api_mode") or None
+                    # The review fork needs to call agent-loop tools (memory,
+                    # skill_manage). Those tools require Hermes' own dispatch,
+                    # which the codex_app_server runtime bypasses entirely
+                    # (it runs the turn inside codex's subprocess). So when
+                    # the parent is on codex_app_server, downgrade the review
+                    # fork to codex_responses — same auth/credentials, but
+                    # talks to the OpenAI Responses API directly so Hermes
+                    # owns the loop and the agent-loop tools dispatch.
+                    if _parent_api_mode == "codex_app_server":
+                        _parent_api_mode = "codex_responses"
                     review_agent = AIAgent(
                         model=self.model,
                         max_iterations=16,
                         quiet_mode=True,
                         platform=self.platform,
                         provider=self.provider,
-                        api_mode=_parent_runtime.get("api_mode") or None,
+                        api_mode=_parent_api_mode,
                         base_url=_parent_runtime.get("base_url") or None,
                         api_key=_parent_runtime.get("api_key") or None,
                         credential_pool=getattr(self, "_credential_pool", None),
@@ -12046,6 +12057,7 @@ class AIAgent:
                 original_user_message=original_user_message,
                 messages=messages,
                 effective_task_id=effective_task_id,
+                should_review_memory=_should_review_memory,
             )
 
         while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call:
@@ -15500,6 +15512,7 @@ class AIAgent:
         original_user_message: Any,
         messages: List[Dict[str, Any]],
         effective_task_id: str,
+        should_review_memory: bool = False,
     ) -> Dict[str, Any]:
         """Codex app-server runtime path. Hands the entire turn to a `codex
         app-server` subprocess and projects its events back into Hermes'
@@ -15565,13 +15578,45 @@ class AIAgent:
             getattr(self, "_iters_since_skill", 0) + turn.tool_iterations
         )
 
-        # Fire the background review fork on the same cadence as the default
-        # path. _spawn_background_review reads the messages list snapshot, so
-        # it works identically here.
-        try:
-            self._spawn_background_review()
-        except Exception:
-            logger.debug("background review spawn raised", exc_info=True)
+        # Now check the skill nudge AFTER iters were incremented — same
+        # pattern the chat_completions path uses (line ~15432).
+        should_review_skills = False
+        if (
+            self._skill_nudge_interval > 0
+            and self._iters_since_skill >= self._skill_nudge_interval
+            and "skill_manage" in self.valid_tool_names
+        ):
+            should_review_skills = True
+            self._iters_since_skill = 0
+
+        # External memory provider sync (mirrors line ~15439). Skipped on
+        # interrupt/error to avoid feeding partial transcripts to memory.
+        if not turn.interrupted and turn.error is None:
+            try:
+                self._sync_external_memory_for_turn(
+                    original_user_message=original_user_message,
+                    final_response=turn.final_text,
+                    interrupted=False,
+                )
+            except Exception:
+                logger.debug("external memory sync raised", exc_info=True)
+
+        # Background review fork — same cadence + signature as the default
+        # path (line ~15449). Only fires when a trigger actually tripped AND
+        # we have a real final response.
+        if (
+            turn.final_text
+            and not turn.interrupted
+            and (should_review_memory or should_review_skills)
+        ):
+            try:
+                self._spawn_background_review(
+                    messages_snapshot=list(messages),
+                    review_memory=should_review_memory,
+                    review_skills=should_review_skills,
+                )
+            except Exception:
+                logger.debug("background review spawn raised", exc_info=True)
 
         return {
             "final_response": turn.final_text,
