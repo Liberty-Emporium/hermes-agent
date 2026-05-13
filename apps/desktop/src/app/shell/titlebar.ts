@@ -3,7 +3,7 @@ import type { HermesConnection } from '@/global'
 export const TITLEBAR_HEIGHT = 34
 export const MACOS_TRAFFIC_LIGHTS_HEIGHT = 14
 export const TITLEBAR_ICON_SIZE = 12
-export const TITLEBAR_CONTROL_OFFSET_X = 60
+export const TITLEBAR_CONTROL_OFFSET_X = 74
 export const TITLEBAR_CONTROL_HEIGHT = 22
 export const TITLEBAR_CONTROLS_TOP = (TITLEBAR_HEIGHT - TITLEBAR_CONTROL_HEIGHT) / 2
 // Edge inset used when no left-side native controls take up that space —
