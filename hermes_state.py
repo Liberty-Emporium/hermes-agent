@@ -25,7 +25,7 @@ from pathlib import Path
 
 from agent.memory_manager import sanitize_context
 from hermes_constants import get_hermes_home
-from typing import Any, Callable, Dict, List, Optional, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -1685,6 +1685,113 @@ class SessionDB:
                     msg["tool_calls"] = []
             result.append(msg)
         return result
+
+    def get_anchored_view(
+        self,
+        session_id: str,
+        around_message_id: int,
+        window: int = 5,
+        bookend: int = 3,
+        keep_roles: Optional[Tuple[str, ...]] = ("user", "assistant"),
+    ) -> Dict[str, Any]:
+        """Return an anchored window plus session bookends, opinionated for guided recall.
+
+        Built on top of ``get_messages_around``:
+          - ``window``: messages immediately surrounding the anchor. Filtered to
+            ``keep_roles`` (tool-response noise dropped by default), EXCEPT the
+            anchor itself is always included regardless of role — callers may
+            have anchored on a tool message and dropping it would break the
+            contract.
+          - ``bookend_start``: first ``bookend`` messages of the session
+            (filtered to ``keep_roles``), but ONLY those whose id sits strictly
+            before the window's first message id. If the window already covers
+            the session start, ``bookend_start`` is an empty list.
+          - ``bookend_end``: last ``bookend`` messages of the session (same
+            filter + non-overlap rule applied at the tail).
+
+        Bookends exist so an FTS5 hit anywhere in a long session still yields
+        the goal (opening) and the resolution (closing) on a single guided
+        call — without the cost of fetching the whole transcript.
+
+        Returns ``{"window": []}`` (empty) when the anchor isn't in the
+        session — caller decides how to surface that.
+
+        ``keep_roles=None`` disables role filtering entirely (raw window +
+        raw bookends). Pass an explicit tuple to override the default.
+        """
+        if bookend < 0:
+            bookend = 0
+
+        # Reuse the primitive — it already handles the anchor-existence check,
+        # window clamping, content decoding, and tool_calls deserialisation.
+        window_rows = self.get_messages_around(
+            session_id, around_message_id, window=window
+        )
+        if not window_rows:
+            return {"window": [], "bookend_start": [], "bookend_end": []}
+
+        # Apply role filter to the window, but never drop the anchor itself.
+        if keep_roles is not None:
+            keep_set = set(keep_roles)
+            filtered_window = [
+                m for m in window_rows
+                if m.get("id") == around_message_id or m.get("role") in keep_set
+            ]
+        else:
+            filtered_window = window_rows
+
+        window_min_id = window_rows[0]["id"]
+        window_max_id = window_rows[-1]["id"]
+
+        # Fetch bookends only if there's space outside the window. The SQL
+        # filters by id range + role so we don't pull tool blobs we'd just
+        # drop. ``bookend=0`` short-circuits both queries.
+        bookend_start_rows: List[Any] = []
+        bookend_end_rows: List[Any] = []
+        if bookend > 0:
+            with self._lock:
+                role_clause = ""
+                role_params: list = []
+                if keep_roles is not None:
+                    role_placeholders = ",".join("?" for _ in keep_roles)
+                    role_clause = f" AND role IN ({role_placeholders})"
+                    role_params = list(keep_roles)
+
+                bookend_start_rows = self._conn.execute(
+                    f"SELECT * FROM messages "
+                    f"WHERE session_id = ? AND id < ?{role_clause} "
+                    f"ORDER BY id ASC LIMIT ?",
+                    (session_id, window_min_id, *role_params, bookend),
+                ).fetchall()
+
+                bookend_end_rows = self._conn.execute(
+                    f"SELECT * FROM messages "
+                    f"WHERE session_id = ? AND id > ?{role_clause} "
+                    f"ORDER BY id DESC LIMIT ?",
+                    (session_id, window_max_id, *role_params, bookend),
+                ).fetchall()
+                # End rows came back DESC for the LIMIT cap; flip to ASC.
+                bookend_end_rows = list(reversed(bookend_end_rows))
+
+        def _hydrate(row) -> Dict[str, Any]:
+            msg = dict(row)
+            if "content" in msg:
+                msg["content"] = self._decode_content(msg["content"])
+            if msg.get("tool_calls"):
+                try:
+                    msg["tool_calls"] = json.loads(msg["tool_calls"])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(
+                        "Failed to deserialize tool_calls in get_anchored_view, falling back to []"
+                    )
+                    msg["tool_calls"] = []
+            return msg
+
+        return {
+            "window": filtered_window,
+            "bookend_start": [_hydrate(r) for r in bookend_start_rows],
+            "bookend_end": [_hydrate(r) for r in bookend_end_rows],
+        }
 
     def resolve_resume_session_id(self, session_id: str) -> str:
         """Redirect a resume target to the descendant session that holds the messages.

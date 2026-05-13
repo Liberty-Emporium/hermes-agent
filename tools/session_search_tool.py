@@ -586,11 +586,18 @@ def _guided_drill_down(
             })
             continue
 
-        # Fetch the window.
+        # Fetch the window + bookends. ``get_anchored_view`` filters tool-response
+        # noise from the window (anchor itself is preserved regardless of role)
+        # and returns up to ``bookend`` user/assistant messages from the session
+        # head and tail — but only when those slices don't overlap the window.
+        # See SessionDB.get_anchored_view for the contract.
         try:
-            messages = db.get_messages_around(a_sid, a_msg_id, window=window)
+            view = db.get_anchored_view(a_sid, a_msg_id, window=window, bookend=3)
+            messages = view.get("window") or []
+            bookend_start = view.get("bookend_start") or []
+            bookend_end = view.get("bookend_end") or []
         except Exception as e:
-            logging.debug("get_messages_around failed: %s", e, exc_info=True)
+            logging.debug("get_anchored_view failed: %s", e, exc_info=True)
             windows_out.append({
                 "success": False,
                 "error": f"failed to load messages around {a_msg_id} in {a_sid}: {e}",
@@ -640,9 +647,14 @@ def _guided_drill_down(
                 o_root = _resolve_to_parent(owning)
                 if a_root and o_root and a_root == o_root:
                     try:
-                        messages = db.get_messages_around(owning, a_msg_id, window=window)
+                        rebind_view = db.get_anchored_view(
+                            owning, a_msg_id, window=window, bookend=3
+                        )
+                        messages = rebind_view.get("window") or []
+                        bookend_start = rebind_view.get("bookend_start") or []
+                        bookend_end = rebind_view.get("bookend_end") or []
                     except Exception as e:
-                        logging.debug("rebind get_messages_around failed: %s", e, exc_info=True)
+                        logging.debug("rebind get_anchored_view failed: %s", e, exc_info=True)
                         messages = []
                     if messages:
                         rebind_warning = (
@@ -691,6 +703,18 @@ def _guided_drill_down(
             entry = {k: v for k, v in entry.items() if v is not None or k in ("content",)}
             out_messages.append(entry)
 
+        def _shape_bookend(m: Dict[str, Any]) -> Dict[str, Any]:
+            entry = {
+                "id": m.get("id"),
+                "role": m.get("role"),
+                "content": m.get("content"),
+                "timestamp": m.get("timestamp"),
+            }
+            return {k: v for k, v in entry.items() if v is not None or k in ("content",)}
+
+        out_bookend_start = [_shape_bookend(m) for m in bookend_start]
+        out_bookend_end = [_shape_bookend(m) for m in bookend_end]
+
         success_entry = {
             "success": True,
             "session_id": a_sid,
@@ -704,6 +728,8 @@ def _guided_drill_down(
             "messages": out_messages,
             "messages_before": messages_before,
             "messages_after": messages_after,
+            "bookend_start": out_bookend_start,
+            "bookend_end": out_bookend_end,
         }
         if rebind_warning:
             success_entry["warning"] = rebind_warning
@@ -730,6 +756,8 @@ def _guided_drill_down(
                 "messages": only["messages"],
                 "messages_before": only["messages_before"],
                 "messages_after": only["messages_after"],
+                "bookend_start": only.get("bookend_start", []),
+                "bookend_end": only.get("bookend_end", []),
             })
             if only.get("warning"):
                 response["warning"] = only["warning"]
@@ -827,10 +855,16 @@ def session_search(
     query = query.strip()
 
     try:
-        # Parse role filter
+        # Parse role filter. When caller didn't pass one, default to
+        # user+assistant — tool messages are usually noisy (serialised tool
+        # calls, large outputs) and rarely the signal someone is searching
+        # for. Callers can opt back in by passing role_filter='user,assistant,tool'
+        # or just 'tool' when debugging tool output.
         role_list = None
         if role_filter and role_filter.strip():
             role_list = [r.strip() for r in role_filter.split(",") if r.strip()]
+        else:
+            role_list = ["user", "assistant"]
 
         # FTS5 search -- get matches ranked by relevance
         raw_results = db.search_messages(
@@ -1116,9 +1150,12 @@ SESSION_SEARCH_SCHEMA = {
         "call. ~10ms, ~1 KB per session. Use this for ANY recall question — discovery AND state "
         "reconstruction. Returns session_id + match_message_id anchors you then drill into.\n"
         "  • mode='guided' (standard follow-up) — given (session_id, message_id) anchors from a "
-        "prior fast call, returns a window of raw messages around each anchor. No LLM, no "
-        "truncation, ~ms latency. This is how you actually read what happened — fast finds the "
-        "sessions, guided reads the transcript. **Never invent anchors or guess session_ids — "
+        "prior fast call, returns a window of raw messages around each anchor plus session "
+        "bookends (first/last few user+assistant messages, when they don't already overlap the "
+        "window). No LLM, no truncation, ~ms latency. This is how you actually read what "
+        "happened — fast finds the sessions, guided reads the transcript with start-and-end "
+        "context guaranteed. Tool messages around the anchor are filtered (anchor itself "
+        "preserved) so payload stays signal-dense. **Never invent anchors or guess session_ids — "
         "guided will reject pairs that don't match real messages.**\n"
         "  • mode='summary' — LLM-generated recap across matched sessions. ~30s, ~$2/call in aux "
         "LLM cost. Trades latency + cost for prose synthesis. Reach for it when you genuinely "
@@ -1167,7 +1204,7 @@ SESSION_SEARCH_SCHEMA = {
             },
             "role_filter": {
                 "type": "string",
-                "description": "Optional: only search messages from specific roles (comma-separated). E.g. 'user,assistant' to skip tool outputs. Ignored when mode='guided'.",
+                "description": "Optional: only search messages from specific roles (comma-separated). Defaults to 'user,assistant' for fast/summary modes — tool messages are usually noisy (large outputs, serialised tool calls). Pass 'user,assistant,tool' to include tool output (debugging tool behaviour) or 'tool' to search tool output only. Ignored when mode='guided'.",
             },
             "limit": {
                 "type": "integer",

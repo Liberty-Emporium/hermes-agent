@@ -1211,6 +1211,19 @@ class TestGuidedMode:
             "model": "test-model",
             "title": "Some title",
         }
+
+        # Bridge get_anchored_view → get_messages_around so existing test
+        # fixtures that set up .return_value / .side_effect on the old
+        # primitive keep working. Tests that want to assert bookend
+        # behaviour can override db.get_anchored_view directly.
+        def _anchored_view(session_id, around_message_id, window=5, bookend=3):
+            rows = db.get_messages_around(session_id, around_message_id, window=window)
+            return {
+                "window": rows or [],
+                "bookend_start": [],
+                "bookend_end": [],
+            }
+        db.get_anchored_view.side_effect = _anchored_view
         return db
 
     def test_returns_window_around_anchor_with_metadata(self):
@@ -1406,6 +1419,11 @@ class TestGuidedMode:
                 ]
             return []
         db.get_messages_around.side_effect = _get_messages_around
+        db.get_anchored_view.side_effect = lambda sid, mid, window=5, bookend=3: {
+            "window": _get_messages_around(sid, mid, window),
+            "bookend_start": [],
+            "bookend_end": [],
+        }
 
         # Safety-net lookup: which session owns message 4242? child_sid.
         db.get_session_id_for_message = lambda mid: "child_sid" if mid == 4242 else None
@@ -1454,6 +1472,9 @@ class TestGuidedMode:
 
         # Anchor 4242 is empty in A but owned by B (different lineage).
         db.get_messages_around.return_value = []
+        db.get_anchored_view.return_value = {
+            "window": [], "bookend_start": [], "bookend_end": [],
+        }
         db.get_session_id_for_message = lambda mid: "lineage_B" if mid == 4242 else None
 
         result = json.loads(session_search(
@@ -1588,6 +1609,17 @@ class TestGuidedModeMultiAnchor:
         from unittest.mock import MagicMock
 
         db = MagicMock()
+
+        # Bridge get_anchored_view → get_messages_around so test fixtures that
+        # configure the old primitive keep working under the new contract.
+        def _anchored_view(session_id, around_message_id, window=5, bookend=3):
+            rows = db.get_messages_around(session_id, around_message_id, window=window)
+            return {
+                "window": rows or [],
+                "bookend_start": [],
+                "bookend_end": [],
+            }
+        db.get_anchored_view.side_effect = _anchored_view
         return db
 
     def _stub_session(self, db, session_id):
@@ -1827,3 +1859,126 @@ class TestGuidedModeMultiAnchor:
         assert rejected["success"] is False
         assert "current session" in rejected["error"].lower()
         assert accepted["success"] is True
+
+
+class TestGuidedBookendsInResponse:
+    """Guided responses surface session bookends so an FTS5 hit anywhere in
+    a long session still yields the session goal + resolution."""
+
+    def _make_db(self, view):
+        from unittest.mock import MagicMock
+
+        db = MagicMock()
+        db.get_session.return_value = {
+            "id": "sid",
+            "parent_session_id": None,
+            "source": "cli",
+            "started_at": 1709400000,
+            "model": "test-model",
+            "title": "Long session",
+        }
+        db.get_anchored_view.return_value = view
+        return db
+
+    def test_single_anchor_response_includes_bookend_fields(self):
+        from tools.session_search_tool import session_search
+
+        db = self._make_db({
+            "window": [
+                {"id": 100, "role": "user", "content": "anchor-ish"},
+                {"id": 101, "role": "assistant", "content": "reply"},
+            ],
+            "bookend_start": [
+                {"id": 1, "role": "user", "content": "session opening"},
+                {"id": 2, "role": "assistant", "content": "got it"},
+            ],
+            "bookend_end": [
+                {"id": 500, "role": "user", "content": "loose ends?"},
+                {"id": 501, "role": "assistant", "content": "all wrapped"},
+            ],
+        })
+
+        result = json.loads(session_search(
+            query="",
+            db=db,
+            mode="guided",
+            session_id="sid",
+            around_message_id=100,
+        ))
+
+        assert result["success"] is True
+        assert "bookend_start" in result and "bookend_end" in result
+        assert [m["id"] for m in result["bookend_start"]] == [1, 2]
+        assert [m["id"] for m in result["bookend_end"]] == [500, 501]
+        # Bookends are shaped tighter than window entries — no tool_call fields.
+        for m in result["bookend_start"] + result["bookend_end"]:
+            assert set(m.keys()).issubset({"id", "role", "content", "timestamp"})
+
+    def test_empty_bookends_when_window_covers_session_boundaries(self):
+        from tools.session_search_tool import session_search
+
+        db = self._make_db({
+            "window": [
+                {"id": 1, "role": "user", "content": "first"},
+                {"id": 2, "role": "assistant", "content": "last"},
+            ],
+            "bookend_start": [],
+            "bookend_end": [],
+        })
+
+        result = json.loads(session_search(
+            query="",
+            db=db,
+            mode="guided",
+            session_id="sid",
+            around_message_id=1,
+        ))
+
+        assert result["bookend_start"] == []
+        assert result["bookend_end"] == []
+
+
+class TestFastModeRoleFilterDefault:
+    """Fast mode defaults role_filter to user,assistant — tool messages are
+    usually noisy and rarely the signal someone is searching for."""
+
+    def _make_db(self):
+        from unittest.mock import MagicMock
+
+        db = MagicMock()
+        db.search_messages.return_value = []
+        db.get_session.return_value = None
+        return db
+
+    def test_fast_defaults_role_filter_to_user_assistant(self):
+        from tools.session_search_tool import session_search
+
+        db = self._make_db()
+        session_search(query="anything", db=db, mode="fast")
+
+        kwargs = db.search_messages.call_args.kwargs
+        assert kwargs["role_filter"] == ["user", "assistant"]
+
+    def test_explicit_role_filter_overrides_default(self):
+        from tools.session_search_tool import session_search
+
+        db = self._make_db()
+        session_search(
+            query="anything", db=db, mode="fast",
+            role_filter="user,assistant,tool",
+        )
+
+        kwargs = db.search_messages.call_args.kwargs
+        assert kwargs["role_filter"] == ["user", "assistant", "tool"]
+
+    def test_explicit_tool_only_filter_passes_through(self):
+        """When debugging tool output, caller can opt back into tool-only."""
+        from tools.session_search_tool import session_search
+
+        db = self._make_db()
+        session_search(
+            query="anything", db=db, mode="fast", role_filter="tool",
+        )
+
+        kwargs = db.search_messages.call_args.kwargs
+        assert kwargs["role_filter"] == ["tool"]
