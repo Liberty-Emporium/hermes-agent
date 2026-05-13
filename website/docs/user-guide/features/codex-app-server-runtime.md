@@ -12,10 +12,66 @@ This is **opt-in only**. Default Hermes behavior is unchanged unless you flip th
 ## Why
 
 - Run OpenAI agent turns against your **ChatGPT subscription** (no API key required) using the same auth flow Codex CLI uses.
-- Use **Codex's own toolset and sandbox** — `apply_patch` with Codex's diff format, seatbelt/landlock sandboxing, native shell execution.
+- Use **Codex's own toolset and sandbox** — `shell` for terminal/read/write/search, `apply_patch` for structured edits, `update_plan` for planning, all running inside seatbelt/landlock sandboxing.
 - **Native Codex plugins** — Linear, GitHub, Gmail, Calendar, Canva, etc. — installed via `codex plugin` are auto-migrated and active in your Hermes session.
 - **Hermes' richer tools come along** — web_search, web_extract, browser automation, vision, image generation, skills, and TTS work via an MCP callback. Codex calls back into Hermes for tools it doesn't have built in.
 - **Memory and skill nudges keep working** — Codex's events are projected into Hermes' message shape so the self-improvement loop sees a normal-looking transcript.
+
+## What tools the model actually has
+
+This is the part most users want to know up front. When this runtime is on, the model running your turn has three independent sources of tools:
+
+### 1. Codex's built-in toolset (always on)
+
+These come with `codex app-server` itself — no Hermes involvement, no MCP, no plugins:
+
+- **`shell`** — runs arbitrary shell commands inside the sandbox. This is how the model reads files (`cat`, `head`, `tail`), writes them (`echo > foo`, heredocs), searches them (`find`, `rg`, `grep`), navigates directories (`ls`, `cd`), runs builds, manages processes, and anything else you'd do in bash.
+- **`apply_patch`** — applies a structured multi-file diff in Codex's patch format. The model uses this for non-trivial code edits (adding a function, refactoring across files); shell heredocs are still available for one-off writes.
+- **`update_plan`** — codex's internal todo/plan tracker. Equivalent to Hermes' `todo` tool but managed by codex's runtime.
+- **`view_image`** — load a local image into the conversation so the model can see it.
+- **`web_search`** — codex has its own built-in web search when configured. Hermes also exposes `web_search` (Firecrawl-backed) via the callback below; the model picks whichever it prefers.
+
+So **anything you'd do via terminal — read/write/search/find/run — codex does natively**. The sandbox profile (`:workspace` by default when you enable the runtime) controls what's writable.
+
+### 2. Native Codex plugins (auto-migrated from your `codex plugin` install)
+
+When you enable the runtime, Hermes queries codex's `plugin/list` RPC and writes a `[plugins."<name>@openai-curated"]` entry for every plugin you have installed. The plugins themselves are managed by codex and authorized once via codex's own UI.
+
+Examples (the ones the OpenClaw thread highlighted as "YouTube-video-worthy"):
+
+- **Linear** — find/update issues
+- **GitHub** — search code, view PRs, comment
+- **Gmail** — read/send mail
+- **Google Calendar** — create/find events
+- **Outlook calendar/email** — same shape via the Microsoft connector
+- **Canva** — design generation
+- ...whatever else you've installed via `codex plugin marketplace add openai-curated` + `codex plugin install ...`
+
+What's NOT migrated:
+- Plugins you haven't installed yet — install them in Codex first.
+- ChatGPT app marketplace entries (`app/list`) — these are already enabled inside codex by virtue of your account auth.
+
+### 3. Hermes tool callback (MCP server, registered in `~/.codex/config.toml`)
+
+Hermes registers itself as an MCP server so codex can call back for tools codex doesn't ship with. Available via the callback:
+
+- **`web_search`** / **`web_extract`** — Firecrawl-backed; tends to be cleaner than scraping for structured content.
+- **`browser_navigate` / `browser_click` / `browser_type` / `browser_press` / `browser_snapshot` / `browser_scroll` / `browser_back` / `browser_get_images` / `browser_console` / `browser_vision`** — full browser automation via Camofox or Browserbase.
+- **`vision_analyze`** — call a separate vision model to inspect an image (different from codex's `view_image` which loads it into the conversation).
+- **`image_generate`** — image generation through Hermes' image_gen plugin chain.
+- **`skill_view` / `skills_list`** — read from Hermes' skill library.
+- **`text_to_speech`** — TTS through Hermes' configured provider.
+
+When the model wants one of these, codex spawns the `hermes_tools_mcp_server` subprocess via stdio MCP, the call is dispatched through `model_tools.handle_function_call()` (same code path as Hermes' default runtime), and the result is returned to codex like any other MCP response.
+
+### What's NOT available on this runtime
+
+These four Hermes tools require the running AIAgent context (mid-loop state) to dispatch, and a stateless MCP callback can't drive them. Switch back to the default runtime (`/codex-runtime auto`) when you need any of them:
+
+- **`delegate_task`** — spawn subagents
+- **`memory`** — Hermes' persistent memory store
+- **`session_search`** — cross-session search
+- **`todo`** — Hermes' todo store (codex's `update_plan` is the in-runtime equivalent)
 
 ## Trade-offs
 
@@ -28,8 +84,11 @@ This is **opt-in only**. Default Hermes behavior is unchanged unless you flip th
 | `vision_analyze`, `image_generate` | yes | yes (via MCP callback) |
 | `skill_view`, `skills_list` | yes | yes (via MCP callback) |
 | `text_to_speech` | yes | yes (via MCP callback) |
-| Codex `apply_patch` + sandbox | — | yes (Codex built-in) |
-| Codex shell + read/write files | — | yes (Codex built-in) |
+| Codex `shell` (terminal/read/write/search/find/run) | — | yes (Codex built-in) |
+| Codex `apply_patch` (structured multi-file edits) | — | yes (Codex built-in) |
+| Codex `update_plan` (in-runtime todo) | — | yes (Codex built-in) |
+| Codex `view_image` (load image into conversation) | — | yes (Codex built-in) |
+| Codex sandbox (seatbelt/landlock, profiles) | — | yes (Codex built-in) |
 | ChatGPT subscription auth | — | yes (via `openai-codex` provider) |
 | Native Codex plugins (Linear, GitHub, etc.) | — | yes (auto-migrated) |
 | User MCP servers | yes | yes (auto-migrated to codex) |
@@ -250,7 +309,8 @@ If you find a bug, [open an issue](https://github.com/NousResearch/hermes-agent/
         │  codex app-server (subprocess)    │──────────────┘
         │   thread/start, turn/start        │
         │   item/* notifications            │
-        │   apply_patch + shell + sandbox   │
+        │   shell + apply_patch + update_plan│
+        │   view_image + sandbox            │
         │   ┌─────────────────────────┐     │
         │   │  MCP client             │     │
         │   │  ├─ user MCP servers    │     │
