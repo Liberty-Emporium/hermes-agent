@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
-import { TITLEBAR_CONTROL_OFFSET_X, TITLEBAR_EDGE_INSET, titlebarControlsPosition } from './titlebar'
+import {
+  TITLEBAR_CONTROL_OFFSET_X,
+  TITLEBAR_EDGE_INSET,
+  TITLEBAR_FALLBACK_WINDOW_BUTTON_X,
+  titlebarControlsPosition
+} from './titlebar'
 
 describe('titlebarControlsPosition', () => {
   it('offsets controls from visible traffic lights', () => {
@@ -13,6 +18,11 @@ describe('titlebarControlsPosition', () => {
 
   it('pins to the edge on Windows/Linux where native controls render on the right', () => {
     expect(titlebarControlsPosition(null).left).toBe(TITLEBAR_EDGE_INSET)
-    expect(titlebarControlsPosition(undefined).left).toBe(TITLEBAR_EDGE_INSET)
+  })
+
+  it('uses the macOS fallback while the initial window state is unknown', () => {
+    expect(titlebarControlsPosition(undefined).left).toBe(
+      TITLEBAR_FALLBACK_WINDOW_BUTTON_X + TITLEBAR_CONTROL_OFFSET_X
+    )
   })
 })

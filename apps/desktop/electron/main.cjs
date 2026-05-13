@@ -7,6 +7,7 @@ const {
   dialog,
   ipcMain,
   nativeImage,
+  nativeTheme,
   safeStorage,
   session,
   shell,
@@ -130,6 +131,20 @@ const APP_ICON_PATHS = [
   path.join(APP_ROOT, 'dist', 'apple-touch-icon.png'),
   path.join(unpackedPathFor(APP_ROOT), 'dist', 'apple-touch-icon.png')
 ]
+
+function getTitleBarOverlayOptions() {
+  if (IS_MAC) {
+    return { height: TITLEBAR_HEIGHT }
+  }
+
+  const useDarkColors = nativeTheme.shouldUseDarkColors
+
+  return {
+    color: useDarkColors ? '#111111' : '#f7f7f7',
+    height: TITLEBAR_HEIGHT,
+    symbolColor: useDarkColors ? '#f7f7f7' : '#242424'
+  }
+}
 
 const MEDIA_MIME_TYPES = {
   '.avi': 'video/x-msvideo',
@@ -2505,9 +2520,7 @@ function createWindow() {
     // to paint native min/max/close in the top-right of the renderer; on
     // macOS it just reserves a content inset alongside the traffic lights.
     titleBarStyle: 'hidden',
-    titleBarOverlay: IS_MAC
-      ? { height: TITLEBAR_HEIGHT }
-      : { color: '#f7f7f7', height: TITLEBAR_HEIGHT, symbolColor: '#242424' },
+    titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
     vibrancy: IS_MAC ? 'sidebar' : undefined,
     icon,
@@ -2527,6 +2540,12 @@ function createWindow() {
     if (icon) {
       app.dock?.setIcon(icon)
     }
+  }
+
+  if (!IS_MAC) {
+    nativeTheme.on('updated', () => {
+      mainWindow?.setTitleBarOverlay?.(getTitleBarOverlayOptions())
+    })
   }
 
   mainWindow.on('will-enter-full-screen', () => sendWindowStateChanged(true))

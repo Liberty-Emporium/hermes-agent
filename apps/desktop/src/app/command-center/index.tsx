@@ -249,6 +249,7 @@ export function CommandCenterView({
   const [usageLoading, setUsageLoading] = useState(false)
   const [usageError, setUsageError] = useState('')
   const searchRequestRef = useRef(0)
+  const usageRequestRef = useRef(0)
 
   const debouncedQuery = useDebouncedValue(query.trim(), 180)
 
@@ -367,16 +368,25 @@ export function CommandCenterView({
 
   const refreshUsage = useCallback(
     async (days: UsagePeriod) => {
+      const requestId = usageRequestRef.current + 1
+      usageRequestRef.current = requestId
       setUsageLoading(true)
       setUsageError('')
 
       try {
         const response = await getUsageAnalytics(days)
-        setUsage(response)
+
+        if (usageRequestRef.current === requestId) {
+          setUsage(response)
+        }
       } catch (error) {
-        setUsageError(error instanceof Error ? error.message : String(error))
+        if (usageRequestRef.current === requestId) {
+          setUsageError(error instanceof Error ? error.message : String(error))
+        }
       } finally {
-        setUsageLoading(false)
+        if (usageRequestRef.current === requestId) {
+          setUsageLoading(false)
+        }
       }
     },
     []
