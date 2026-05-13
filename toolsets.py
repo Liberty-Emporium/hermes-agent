@@ -107,6 +107,17 @@ TOOLSETS = {
         "includes": []
     },
 
+    "video_gen": {
+        "description": (
+            "Video generation tools. Single ``video_generate`` tool covers "
+            "text-to-video, image-to-video, video edit, and video extend; "
+            "the active backend (xAI, FAL, Google Veo, ...) is configured "
+            "via ``hermes tools`` → Video Generation."
+        ),
+        "tools": ["video_generate"],
+        "includes": []
+    },
+
     "computer_use": {
         "description": (
             "Background macOS desktop control via cua-driver — screenshots, "
