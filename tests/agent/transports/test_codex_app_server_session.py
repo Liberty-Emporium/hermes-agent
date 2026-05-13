@@ -104,11 +104,11 @@ def make_session(client: FakeClient, **kwargs) -> CodexAppServerSession:
 
 class TestApprovalChoiceMapping:
     @pytest.mark.parametrize("choice,expected", [
-        ("once", "approved"),
-        ("session", "approvedForSession"),
-        ("always", "approvedForSession"),
-        ("deny", "denied"),
-        ("anything-else", "denied"),
+        ("once", "accept"),
+        ("session", "acceptForSession"),
+        ("always", "acceptForSession"),
+        ("deny", "decline"),
+        ("anything-else", "decline"),
     ])
     def test_mapping(self, choice, expected):
         assert _approval_choice_to_codex_decision(choice) == expected
@@ -127,13 +127,17 @@ class TestLifecycle:
         method_calls = [m for (m, _) in client.requests if m == "thread/start"]
         assert len(method_calls) == 1
 
-    def test_thread_start_passes_cwd_and_permissions(self):
+    def test_thread_start_passes_cwd_only(self):
+        """thread/start carries cwd. We intentionally do NOT pass `permissions`
+        on this codex version (experimentalApi-gated + requires matching
+        config.toml [permissions] table). Letting codex use its default
+        (read-only unless user configures otherwise) is the documented path."""
         client = FakeClient()
         s = make_session(client, permission_profile="workspace-write")
         s.ensure_started()
         method, params = next(r for r in client.requests if r[0] == "thread/start")
         assert params["cwd"] == "/tmp"
-        assert params.get("permissions") == {"profileId": "workspace-write"}
+        assert "permissions" not in params  # see session.ensure_started() comment
 
     def test_close_idempotent(self):
         client = FakeClient()
@@ -266,7 +270,7 @@ class TestServerRequestRouting:
     def test_exec_approval_with_callback_approves_once(self):
         client = FakeClient()
         client.queue_server_request(
-            "execCommandApproval", request_id="req-1",
+            "item/commandExecution/requestApproval", request_id="req-1",
             command="ls /tmp", cwd="/tmp",
         )
         client.queue_notification(
@@ -284,12 +288,12 @@ class TestServerRequestRouting:
         s = make_session(client, approval_callback=cb)
         s.run_turn("hi", turn_timeout=1.0)
         assert captured["command"] == "ls /tmp"
-        # The session must have responded to the server request with "approved"
-        assert ("req-1", {"decision": "approved"}) in client.responses
+        # The session must have responded to the server request with "accept"
+        assert ("req-1", {"decision": "accept"}) in client.responses
 
     def test_exec_approval_no_callback_denies(self):
         client = FakeClient()
-        client.queue_server_request("execCommandApproval", request_id="req-1",
+        client.queue_server_request("item/commandExecution/requestApproval", request_id="req-1",
                                     command="rm -rf /", cwd="/")
         client.queue_notification(
             "turn/completed", threadId="t",
@@ -297,12 +301,12 @@ class TestServerRequestRouting:
         )
         s = make_session(client)  # no approval_callback wired
         s.run_turn("hi", turn_timeout=1.0)
-        assert ("req-1", {"decision": "denied"}) in client.responses
+        assert ("req-1", {"decision": "decline"}) in client.responses
 
     def test_apply_patch_approval_session_maps_to_session_decision(self):
         client = FakeClient()
         client.queue_server_request(
-            "applyPatchApproval", request_id="req-2",
+            "item/fileChange/requestApproval", request_id="req-2",
             changes=[{"kind": {"type": "add"}, "path": "/tmp/x"}],
         )
         client.queue_notification(
@@ -315,7 +319,7 @@ class TestServerRequestRouting:
 
         s = make_session(client, approval_callback=cb)
         s.run_turn("hi", turn_timeout=1.0)
-        assert ("req-2", {"decision": "approvedForSession"}) in client.responses
+        assert ("req-2", {"decision": "acceptForSession"}) in client.responses
 
     def test_unknown_server_request_replied_with_error(self):
         client = FakeClient()
@@ -333,7 +337,7 @@ class TestServerRequestRouting:
 
     def test_routing_auto_approve_bypass(self):
         client = FakeClient()
-        client.queue_server_request("execCommandApproval", request_id="r1",
+        client.queue_server_request("item/commandExecution/requestApproval", request_id="r1",
                                     command="ls", cwd="/")
         client.queue_notification(
             "turn/completed", threadId="t",
@@ -343,11 +347,11 @@ class TestServerRequestRouting:
         s = make_session(client, request_routing=_ServerRequestRouting(
             auto_approve_exec=True))
         s.run_turn("hi", turn_timeout=1.0)
-        assert ("r1", {"decision": "approved"}) in client.responses
+        assert ("r1", {"decision": "accept"}) in client.responses
 
-    def test_callback_raises_falls_back_to_denied(self):
+    def test_callback_raises_falls_back_to_decline(self):
         client = FakeClient()
-        client.queue_server_request("execCommandApproval", request_id="r1",
+        client.queue_server_request("item/commandExecution/requestApproval", request_id="r1",
                                     command="ls", cwd="/")
         client.queue_notification(
             "turn/completed", threadId="t",
@@ -360,4 +364,4 @@ class TestServerRequestRouting:
         s = make_session(client, approval_callback=boom)
         s.run_turn("hi", turn_timeout=1.0)
         # Fail-closed: deny on callback exception
-        assert ("r1", {"decision": "denied"}) in client.responses
+        assert ("r1", {"decision": "decline"}) in client.responses

@@ -133,13 +133,22 @@ class CodexAppServerSession:
             client_title="Hermes Agent",
             client_version=_get_hermes_version(),
         )
-        # We pass `permissions` (experimental) when we know it, falling back
-        # to the implicit profile baked into thread/start. The README warns
-        # that `sandboxPolicy` cannot be combined with `permissions`, so we
-        # never set the legacy field.
+        # Permission selection is intentionally NOT sent on thread/start.
+        # Two reasons (live-tested against codex 0.130.0):
+        #   1. `thread/start.permissions` is gated behind the experimentalApi
+        #      capability on this codex version — we'd have to opt in during
+        #      initialize and accept the unstable surface.
+        #   2. Even with experimentalApi declared and the correct shape
+        #      (`{"type": "profile", "id": "..."}`, not `{"profileId": ...}`),
+        #      codex requires a matching `[permissions]` table in
+        #      ~/.codex/config.toml or it fails the request with
+        #      'default_permissions requires a [permissions] table'.
+        # Letting codex pick its default (`:read-only` unless the user has
+        # configured otherwise in their codex config.toml) is the standard
+        # codex CLI workflow and avoids fighting codex's own validation.
+        # Users who want a write-capable profile configure it in their
+        # ~/.codex/config.toml the same way they would for any codex usage.
         params: dict[str, Any] = {"cwd": self._cwd}
-        if self._permission_profile:
-            params["permissions"] = {"profileId": self._permission_profile}
         result = self._client.request("thread/start", params, timeout=15)
         self._thread_id = result["thread"]["id"]
         logger.info(
@@ -292,19 +301,34 @@ class CodexAppServerSession:
 
     def _handle_server_request(self, req: dict) -> None:
         """Translate a codex server request (approval) into Hermes' approval
-        flow, then send the response."""
+        flow, then send the response.
+
+        Method names verified live against codex 0.130.0 (Apr 2026):
+          item/commandExecution/requestApproval — exec approvals
+          item/fileChange/requestApproval       — apply_patch approvals
+          item/permissions/requestApproval      — permissions changes
+                                                  (we decline; user controls
+                                                  permission profile in
+                                                  ~/.codex/config.toml).
+        """
         if self._client is None:
             return
         method = req.get("method", "")
         rid = req.get("id")
         params = req.get("params") or {}
 
-        if method == "execCommandApproval":
+        if method == "item/commandExecution/requestApproval":
             decision = self._decide_exec_approval(params)
             self._client.respond(rid, {"decision": decision})
-        elif method == "applyPatchApproval":
+        elif method == "item/fileChange/requestApproval":
             decision = self._decide_apply_patch_approval(params)
             self._client.respond(rid, {"decision": decision})
+        elif method == "item/permissions/requestApproval":
+            # Codex sometimes asks to escalate permissions mid-turn. We
+            # always decline — the user already chose their permission
+            # profile in ~/.codex/config.toml and surprise escalations
+            # shouldn't be silently accepted.
+            self._client.respond(rid, {"decision": "decline"})
         else:
             # Unknown server request — codex can extend this surface. Reject
             # cleanly so codex doesn't hang waiting for us.
@@ -315,7 +339,7 @@ class CodexAppServerSession:
 
     def _decide_exec_approval(self, params: dict) -> str:
         if self._routing.auto_approve_exec:
-            return "approved"
+            return "accept"
         command = params.get("command") or ""
         cwd = params.get("cwd") or ""
         if self._approval_callback is not None:
@@ -326,12 +350,12 @@ class CodexAppServerSession:
                 return _approval_choice_to_codex_decision(choice)
             except Exception:
                 logger.exception("approval_callback raised on exec request")
-                return "denied"
-        return "denied"  # fail-closed when no callback wired
+                return "decline"
+        return "decline"  # fail-closed when no callback wired
 
     def _decide_apply_patch_approval(self, params: dict) -> str:
         if self._routing.auto_approve_apply_patch:
-            return "approved"
+            return "accept"
         if self._approval_callback is not None:
             n_changes = len(params.get("changes") or [])
             try:
@@ -343,21 +367,24 @@ class CodexAppServerSession:
                 return _approval_choice_to_codex_decision(choice)
             except Exception:
                 logger.exception("approval_callback raised on apply_patch")
-                return "denied"
-        return "denied"
+                return "decline"
+        return "decline"
 
 
 def _approval_choice_to_codex_decision(choice: str) -> str:
-    """Map Hermes approval choices onto codex decision strings.
+    """Map Hermes approval choices onto codex's CommandExecutionApprovalDecision
+    / FileChangeApprovalDecision wire values.
 
     Hermes returns 'once', 'session', 'always', or 'deny'.
-    Codex expects 'approved', 'approvedForSession', or 'denied'.
+    Codex expects 'accept', 'acceptForSession', 'decline', or 'cancel'
+    (verified against codex-rs/app-server-protocol/src/protocol/v2/item.rs
+    on codex 0.130.0).
     """
     if choice in ("once",):
-        return "approved"
+        return "accept"
     if choice in ("session", "always"):
-        return "approvedForSession"
-    return "denied"
+        return "acceptForSession"
+    return "decline"
 
 
 def _get_hermes_version() -> str:
