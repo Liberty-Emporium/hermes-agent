@@ -62,6 +62,42 @@ class TestModuleSurface:
                 "and can't be reached through a stateless MCP callback"
             )
 
+    def test_kanban_worker_tools_exposed(self):
+        """Kanban workers run as `hermes chat -q` subprocesses; if they
+        come up on the codex_app_server runtime, the worker can do the
+        actual work via codex's shell but needs the kanban tools through
+        the MCP callback to report back to the kernel. Without these
+        tools available, the worker would hang at completion time."""
+        from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
+        # Worker handoff tools — every dispatched worker uses at least
+        # one of {complete, block, comment} to close out its task.
+        for worker_tool in (
+            "kanban_complete",
+            "kanban_block",
+            "kanban_comment",
+            "kanban_heartbeat",
+        ):
+            assert worker_tool in EXPOSED_TOOLS, (
+                f"{worker_tool!r} missing from codex callback — kanban "
+                "workers on codex_app_server runtime would hang"
+            )
+
+    def test_kanban_orchestrator_tools_exposed(self):
+        """Orchestrator agents need to dispatch new tasks, query the
+        board, and unblock/link tasks. Exposed so an orchestrator on
+        codex_app_server can do its job."""
+        from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
+        for orch_tool in (
+            "kanban_create",
+            "kanban_show",
+            "kanban_list",
+            "kanban_unblock",
+            "kanban_link",
+        ):
+            assert orch_tool in EXPOSED_TOOLS, (
+                f"{orch_tool!r} missing from codex callback"
+            )
+
 
 class TestMain:
     def test_main_returns_2_when_mcp_unavailable(self, monkeypatch):

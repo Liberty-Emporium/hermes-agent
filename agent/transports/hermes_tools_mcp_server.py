@@ -75,6 +75,25 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "skill_view",
     "skills_list",
     "text_to_speech",
+    # Kanban worker handoff tools — gated on HERMES_KANBAN_TASK env var
+    # (set by the kanban dispatcher when spawning a worker). Without these
+    # in the callback, a worker spawned with openai_runtime=codex_app_server
+    # could do the work but couldn't report completion back to the kernel,
+    # making it hang until timeout. Stateless dispatch — they just read
+    # the env var and write to ~/.hermes/kanban.db.
+    "kanban_complete",
+    "kanban_block",
+    "kanban_comment",
+    "kanban_heartbeat",
+    "kanban_show",
+    "kanban_list",
+    # NOTE: kanban_create / kanban_unblock / kanban_link are orchestrator-
+    # only — the kanban tool gates them on HERMES_KANBAN_TASK being unset.
+    # They're exposed here for orchestrator agents running on the codex
+    # runtime that need to dispatch new tasks.
+    "kanban_create",
+    "kanban_unblock",
+    "kanban_link",
 )
 
 

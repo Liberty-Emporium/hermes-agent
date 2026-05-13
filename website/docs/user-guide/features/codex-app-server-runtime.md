@@ -73,6 +73,34 @@ These four Hermes tools require the running AIAgent context (mid-loop state) to 
 - **`session_search`** — cross-session search
 - **`todo`** — Hermes' todo store (codex's `update_plan` is the in-runtime equivalent)
 
+## Workflow features (`/goal`, kanban, cron)
+
+### `/goal` (the Ralph loop)
+
+**Works on this runtime.** Goals persist in `state_meta` keyed by session id, the continuation prompt feeds back as a normal user message through `run_conversation()`, and codex executes the next turn natively. The goal judge runs via the auxiliary client (configured via `auxiliary.goal_judge` in config.yaml), independent of which runtime is active. The judge's "blocked, needs user input" verdict is a clean escape if codex stalls on approvals.
+
+**One thing to be aware of:** each continuation prompt is a fresh codex turn, which means codex re-evaluates command approval policy from scratch. If you're doing a long-running goal with lots of writes, expect more approval prompts than you'd see on a single in-session task. Set `default_permissions = ":workspace"` (which Hermes does automatically when you enable the runtime) so simple workspace writes don't require prompting.
+
+### Kanban (multi-agent worktree dispatch)
+
+**Works on this runtime, with one subtle dependency.** The kanban dispatcher spawns each worker as a separate `hermes chat -q` subprocess that reads the user's config — which means if `model.openai_runtime: codex_app_server` is set globally, workers also come up on the codex runtime.
+
+What works inside a codex-runtime worker:
+- Codex's full toolset (shell, apply_patch, update_plan, view_image, web_search) — the worker does its actual task work natively
+- The migrated codex plugins — Linear, GitHub, etc.
+- The Hermes tool callback for browser_*, vision, image_gen, skills, TTS
+
+What also works because the MCP callback exposes them:
+- **`kanban_complete` / `kanban_block` / `kanban_comment` / `kanban_heartbeat`** — the worker handoff tools. These read `HERMES_KANBAN_TASK` from env (set by the dispatcher), gate access correctly, and write to `~/.hermes/kanban.db`. Without these in the callback, a worker on this runtime could do its task but couldn't report back, hanging until the dispatcher's timeout.
+- **`kanban_show` / `kanban_list`** — read-only board queries for the worker to check its own context.
+- **`kanban_create` / `kanban_unblock` / `kanban_link`** — orchestrator-only operations. Available for orchestrator agents running on the codex runtime that need to dispatch new tasks.
+
+The kanban tools are gated by `HERMES_KANBAN_TASK` env var the dispatcher sets — that var is propagated to the codex subprocess (codex inherits env) and from there to the spawned `hermes-tools` MCP server subprocess. So the tools see the right task id and gate correctly.
+
+### Cron jobs
+
+**Not specifically tested.** Cron jobs run via `cronjob` → `AIAgent.run_conversation`, the same code path as the CLI. If the cron job's config has `openai_runtime: codex_app_server` it'll run on codex. The same tool-availability rules apply — codex built-ins + plugins + MCP callback work, agent-loop tools (delegate_task, memory, session_search, todo) don't. If your cron job relies on those, scope the cron to a profile that uses the default runtime.
+
 ## Trade-offs
 
 |  | Hermes default runtime | Codex app-server (opt-in) |
@@ -94,6 +122,9 @@ These four Hermes tools require the running AIAgent context (mid-loop state) to 
 | User MCP servers | yes | yes (auto-migrated to codex) |
 | Memory + skill review (background) | yes | yes (via item projection) |
 | Multi-turn conversations | yes | yes |
+| `/goal` (Ralph loop) | yes | yes |
+| Kanban worker dispatch | yes | yes (via callback) |
+| Kanban orchestrator tools | yes | yes (via callback) |
 | All gateway platforms | yes | yes |
 | Non-OpenAI providers | yes | n/a — OpenAI/Codex-scoped |
 
