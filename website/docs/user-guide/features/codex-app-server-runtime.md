@@ -240,6 +240,35 @@ default_permissions = ":read-only"
 
 (Hermes will preserve your override on re-migration as long as it lives outside the `# managed by hermes-agent` markers.)
 
+## Auxiliary tasks and ChatGPT subscription token cost
+
+When this runtime is on with the `openai-codex` provider, **auxiliary tasks (title generation, context compression, vision auto-detect, session search summarization, the background self-improvement review fork) also flow through your ChatGPT subscription by default**, because Hermes' auxiliary client uses the main provider/model when no per-task override is set.
+
+This isn't specific to `codex_app_server` — it's true for the existing `codex_responses` path too — but it's more visible here because you're explicitly opting in for the subscription billing.
+
+To route specific aux tasks to a cheaper / different model, set explicit overrides in `~/.hermes/config.yaml`:
+
+```yaml
+auxiliary:
+  title_generation:
+    provider: openrouter
+    model: google/gemini-3-flash-preview
+  context_compression:
+    provider: openrouter
+    model: google/gemini-3-flash-preview
+  vision_detect:
+    provider: openrouter
+    model: google/gemini-3-flash-preview
+  session_search:
+    provider: openrouter
+    model: google/gemini-3-flash-preview
+  goal_judge:
+    provider: openrouter
+    model: google/gemini-3-flash-preview
+```
+
+The self-improvement review fork inherits the main runtime via `_current_main_runtime()` and Hermes downgrades it from `codex_app_server` to `codex_responses` automatically (so the fork can actually call `memory` and `skill_manage` — Hermes' own agent-loop tools). That fork still uses your subscription auth unless you've routed aux tasks elsewhere.
+
 ## Editing `~/.codex/config.toml` safely
 
 Hermes wraps everything it manages between two marker comments:
