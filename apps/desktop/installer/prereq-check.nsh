@@ -72,6 +72,103 @@ Var HermesInstallGit
 Var HermesInstallRipgrep
 
 ; ----------------------------------------------------------------------------
+; HermesDetectPythonViaRegistry — sets $HermesHasPython="1" if a PEP 514
+; entry exists for any of the supported Python versions. Reads HKLM
+; (system-wide installs) then HKCU (per-user installs). Vendor "PythonCore"
+; covers official python.org distributions; "ContinuumAnalytics" covers
+; Anaconda/Miniconda. We don't enumerate other vendors because they're
+; rare in our user base and we'd rather miss them and let winget add a
+; second Python than misclassify something else as a working Python.
+; ----------------------------------------------------------------------------
+Function HermesDetectPythonViaRegistry
+  Push $1
+  Push $2
+
+  ; Set view to 64-bit on x64 systems so we read the right hive — the
+  ; default 32-bit view would miss a 64-bit Python install on 64-bit
+  ; Windows. SetRegView 32 restored at function exit.
+  SetRegView 64
+
+  ; Iterate the supported versions. Each is its own ReadRegStr — NSIS
+  ; doesn't have loops over arrays inside functions easily, and four
+  ; copies is clearer than gymnastics with $R0-$R9.
+  ReadRegStr $1 HKLM "SOFTWARE\Python\PythonCore\3.11\InstallPath" ""
+  ${If} $1 != ""
+    StrCpy $HermesHasPython "1"
+    Goto hermes_py_reg_done
+  ${EndIf}
+  ReadRegStr $1 HKLM "SOFTWARE\Python\PythonCore\3.12\InstallPath" ""
+  ${If} $1 != ""
+    StrCpy $HermesHasPython "1"
+    Goto hermes_py_reg_done
+  ${EndIf}
+  ReadRegStr $1 HKLM "SOFTWARE\Python\PythonCore\3.13\InstallPath" ""
+  ${If} $1 != ""
+    StrCpy $HermesHasPython "1"
+    Goto hermes_py_reg_done
+  ${EndIf}
+
+  ReadRegStr $1 HKCU "SOFTWARE\Python\PythonCore\3.11\InstallPath" ""
+  ${If} $1 != ""
+    StrCpy $HermesHasPython "1"
+    Goto hermes_py_reg_done
+  ${EndIf}
+  ReadRegStr $1 HKCU "SOFTWARE\Python\PythonCore\3.12\InstallPath" ""
+  ${If} $1 != ""
+    StrCpy $HermesHasPython "1"
+    Goto hermes_py_reg_done
+  ${EndIf}
+  ReadRegStr $1 HKCU "SOFTWARE\Python\PythonCore\3.13\InstallPath" ""
+  ${If} $1 != ""
+    StrCpy $HermesHasPython "1"
+    Goto hermes_py_reg_done
+  ${EndIf}
+
+hermes_py_reg_done:
+  SetRegView 32
+  Pop $2
+  Pop $1
+FunctionEnd
+
+; ----------------------------------------------------------------------------
+; HermesDetectPythonViaFilesystem — sets $HermesHasPython="1" if a Python
+; install exists at one of the standard locations. FileExists never runs
+; the binary so this is safe even if the user has the MS Store stub on
+; their PATH. We probe both system-wide (Program Files) and per-user
+; (LocalAppData\Programs) install locations for versions 3.11–3.14.
+; ----------------------------------------------------------------------------
+Function HermesDetectPythonViaFilesystem
+  ; System-wide installs (default location for python.org with admin)
+  ${If} ${FileExists} "$PROGRAMFILES64\Python311\python.exe"
+    StrCpy $HermesHasPython "1"
+    Return
+  ${EndIf}
+  ${If} ${FileExists} "$PROGRAMFILES64\Python312\python.exe"
+    StrCpy $HermesHasPython "1"
+    Return
+  ${EndIf}
+  ${If} ${FileExists} "$PROGRAMFILES64\Python313\python.exe"
+    StrCpy $HermesHasPython "1"
+    Return
+  ${EndIf}
+
+  ; Per-user installs (default location for python.org without admin
+  ; or with "Install for me only"). Covers the user-reported case.
+  ${If} ${FileExists} "$LOCALAPPDATA\Programs\Python\Python311\python.exe"
+    StrCpy $HermesHasPython "1"
+    Return
+  ${EndIf}
+  ${If} ${FileExists} "$LOCALAPPDATA\Programs\Python\Python312\python.exe"
+    StrCpy $HermesHasPython "1"
+    Return
+  ${EndIf}
+  ${If} ${FileExists} "$LOCALAPPDATA\Programs\Python\Python313\python.exe"
+    StrCpy $HermesHasPython "1"
+    Return
+  ${EndIf}
+FunctionEnd
+
+; ----------------------------------------------------------------------------
 ; HermesDetectPrereqs — populates $HermesHasWinget / $HermesHasPython /
 ; $HermesHasGit / $HermesHasRipgrep with "0" or "1". Called from the
 ; page-create function.
@@ -86,10 +183,32 @@ Function HermesDetectPrereqs
     StrCpy $HermesHasWinget "0"
   ${EndIf}
 
-  ; --- Python 3.11+ ---
-  ; The py launcher returns exit 0 only when that specific version is
-  ; installed. We probe each version Hermes' pyproject.toml accepts.
+  ; --- Python 3.11 / 3.12 / 3.13 ---
+  ; We deliberately accept 3.11–3.13 only and NOT 3.14, because some of
+  ; Hermes' transitive deps (notably pywinpty, which carries Rust crates
+  ; like windows_x86_64_msvc) don't yet publish 3.14 wheels. Without
+  ; wheels, `pip install -e .` falls back to building from sdist, which
+  ; needs a Rust toolchain. Users without one see a confusing "could
+  ; not compile windows_x86_64_msvc build script" error. install.ps1
+  ; sidesteps this by pinning to 3.11 via uv; the desktop installer
+  ; can't easily install uv in the same flow yet, so we just refuse to
+  ; accept 3.14 as "good" and offer 3.11 via winget instead. Revisit
+  ; when 3.14 wheels are widely available across our dep tree.
+  ;
+  ; Detection strategy, in order from most-precise to least-precise.
+  ; Each step uses ONLY operations that don't execute `python.exe`
+  ; directly off PATH — running `python` on Windows can open the
+  ; Microsoft Store if only the "Python stub" is installed, which is
+  ; terrible UX during an installer. We avoid that by:
+  ;   (a) launcher checks (py.exe runs no python until -V),
+  ;   (b) registry reads (PEP 514, no execution at all),
+  ;   (c) filesystem probes via FileExists.
   StrCpy $HermesHasPython "0"
+
+  ; (1) The py launcher. Ships with python.org installer when
+  ;     "Install launcher for all users" is checked (default for some
+  ;     paths, not for per-user installs without elevation). When
+  ;     present, py -3.X --version returns 0 iff that version exists.
   nsExec::Exec 'cmd.exe /c py -3.11 --version >nul 2>&1'
   Pop $0
   ${If} $0 == 0
@@ -104,14 +223,29 @@ Function HermesDetectPrereqs
       Pop $0
       ${If} $0 == 0
         StrCpy $HermesHasPython "1"
-      ${Else}
-        nsExec::Exec 'cmd.exe /c py -3.14 --version >nul 2>&1'
-        Pop $0
-        ${If} $0 == 0
-          StrCpy $HermesHasPython "1"
-        ${EndIf}
       ${EndIf}
     ${EndIf}
+  ${EndIf}
+
+  ; (2) PEP 514 registry probe. Every standards-compliant Python
+  ;     installer registers itself under HKLM or HKCU at
+  ;     SOFTWARE\Python\PythonCore\<version>\InstallPath. The MS Store
+  ;     stub does NOT register here — so we get a clean signal for
+  ;     "real Python is installed" without ever risking the Store
+  ;     popup. Covers the case the user reported: per-user Python.org
+  ;     install without launcher checkbox, plus Anaconda which writes
+  ;     similar keys under a different vendor name.
+  ${If} $HermesHasPython == "0"
+    Call HermesDetectPythonViaRegistry
+  ${EndIf}
+
+  ; (3) Filesystem probe of common install locations. Catches edge
+  ;     cases where the installer didn't update the registry (rare
+  ;     but possible with hand-extracted Python or some third-party
+  ;     installers). We only check standard paths — running anything
+  ;     would risk spawning the Store stub.
+  ${If} $HermesHasPython == "0"
+    Call HermesDetectPythonViaFilesystem
   ${EndIf}
 
   ; --- Git ---
